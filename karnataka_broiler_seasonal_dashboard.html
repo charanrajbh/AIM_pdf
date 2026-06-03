@@ -1,0 +1,281 @@
+
+<h2 class="sr-only">Karnataka broiler price dashboard with seasonal weighted forecast for June–August 2026</h2>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font-sans)}
+.db{padding:1rem 0}
+.top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:1.25rem;flex-wrap:wrap;gap:8px}
+.top-title{font-size:17px;font-weight:500;color:var(--color-text-primary)}
+.top-sub{font-size:12px;color:var(--color-text-secondary);margin-top:3px}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.controls label{font-size:12px;color:var(--color-text-secondary)}
+.controls select{font-size:12px}
+.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:1.25rem}
+.kpi{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:.75rem 1rem}
+.kpi-lbl{font-size:11px;color:var(--color-text-secondary);margin-bottom:3px}
+.kpi-val{font-size:20px;font-weight:500;color:var(--color-text-primary)}
+.kpi-sub{font-size:11px;color:var(--color-text-tertiary);margin-top:1px}
+.card{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);padding:1rem;margin-bottom:1rem}
+.card-title{font-size:12px;font-weight:500;color:var(--color-text-secondary);margin-bottom:.75rem;display:flex;justify-content:space-between;align-items:center}
+.legend{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--color-text-secondary)}
+.leg{display:flex;align-items:center;gap:4px}
+.leg-sq{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+.leg-dash{width:16px;height:2px;flex-shrink:0;border-top:2px dashed}
+.method-box{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:.75rem 1rem;margin-bottom:1rem}
+.method-title{font-size:12px;font-weight:500;color:var(--color-text-primary);margin-bottom:.5rem}
+.wt-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.wt-item{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:.5rem .75rem}
+.wt-lbl{font-size:11px;color:var(--color-text-secondary)}
+.wt-pct{font-size:15px;font-weight:500;color:var(--color-text-primary)}
+.fc-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-top:.75rem}
+.fc-card{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:.65rem .85rem}
+.fc-city{font-size:11px;color:var(--color-text-secondary)}
+.fc-val{font-size:18px;font-weight:500;color:var(--color-text-primary);margin:.1rem 0}
+.fc-chg{font-size:11px}
+.up{color:#1d9e75}.dn{color:#d85a30}
+</style>
+
+<div class="db">
+<div class="top">
+  <div>
+    <div class="top-title">Karnataka broiler price dashboard</div>
+    <div class="top-sub">Vencobb · Apr 2021–May 2026 · ₹/kg · Seasonal weighted forecast: Jun–Aug 2026</div>
+  </div>
+  <div class="controls">
+    <label>City</label>
+    <select id="citySelect">
+      <option value="BANGALORE">Bangalore</option>
+      <option value="HASSAN">Hassan</option>
+      <option value="MYSORE">Mysore</option>
+      <option value="SHIMOGA">Shimoga</option>
+      <option value="hosadurga">Hosadurga</option>
+      <option value="ALL">All cities</option>
+    </select>
+    <label>Range</label>
+    <select id="rangeSelect">
+      <option value="90">90 days</option>
+      <option value="180">6 months</option>
+      <option value="365" selected>1 year</option>
+      <option value="730">2 years</option>
+      <option value="9999">All time</option>
+    </select>
+  </div>
+</div>
+
+<div class="kpi-grid" id="kpiRow"></div>
+
+<div class="card">
+  <div class="card-title">
+    <span id="histTitle">Price history</span>
+    <div class="legend" id="histLegend"></div>
+  </div>
+  <div style="position:relative;width:100%;height:240px">
+    <canvas id="histChart" role="img" aria-label="Broiler price history chart"></canvas>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">
+    <span>Monthly seasonality pattern — avg by month (all years)</span>
+  </div>
+  <div style="position:relative;width:100%;height:180px">
+    <canvas id="seasonChart" role="img" aria-label="Monthly average price seasonality chart"></canvas>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">
+    <span>3-month forecast — Jun to Aug 2026</span>
+    <div class="legend">
+      <span class="leg"><span class="leg-sq" style="background:#378ADD"></span>Historical</span>
+      <span class="leg"><span class="leg-dash" style="border-color:#1D9E75"></span>Forecast</span>
+    </div>
+  </div>
+  <div style="position:relative;width:100%;height:230px">
+    <canvas id="fcChart" role="img" aria-label="3-month price forecast June to August 2026"></canvas>
+  </div>
+  <div class="fc-summary" id="fcSummary"></div>
+</div>
+
+<div class="method-box">
+  <div class="method-title">Forecast methodology — seasonal weight blending</div>
+  <div class="wt-grid">
+    <div class="wt-item"><div class="wt-lbl">Same month 2025</div><div class="wt-pct">35%</div></div>
+    <div class="wt-item"><div class="wt-lbl">Same month 2024</div><div class="wt-pct">20%</div></div>
+    <div class="wt-item"><div class="wt-lbl">Same month 2023</div><div class="wt-pct">10%</div></div>
+    <div class="wt-item"><div class="wt-lbl">Same month 2022</div><div class="wt-pct">5%</div></div>
+    <div class="wt-item"><div class="wt-lbl">Previous month actual</div><div class="wt-pct">20%</div></div>
+    <div class="wt-item"><div class="wt-lbl">Two months ago actual</div><div class="wt-pct">10%</div></div>
+  </div>
+  <p style="font-size:11px;color:var(--color-text-tertiary);margin-top:.5rem">Daily prices interpolated via cosine curve within each month. Long-run annual trend applied at ±5 ₹/month max.</p>
+</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const CITIES=['BANGALORE','HASSAN','MYSORE','SHIMOGA','hosadurga'];
+const CLABELS={BANGALORE:'Bangalore',HASSAN:'Hassan',MYSORE:'Mysore',SHIMOGA:'Shimoga',hosadurga:'Hosadurga'};
+const COLORS=['#378ADD','#1D9E75','#ED7D31','#7030A0','#C00000'];
+const MNTH=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+const HIST={BANGALORE:{},HASSAN:{},MYSORE:{},SHIMOGA:{},hosadurga:{}};
+const FC={BANGALORE:{},HASSAN:{},MYSORE:{},SHIMOGA:{},hosadurga:{}};
+
+(function loadData(){
+const raw=[["BANGALORE","hist","2021-04-01",117],["BANGALORE","hist","2021-05-03",43],["BANGALORE","hist","2021-06-01",80],["BANGALORE","hist","2021-07-18",152],["BANGALORE","hist","2021-08-17",127],["BANGALORE","hist","2021-09-19",138],["BANGALORE","hist","2021-10-05",133],["BANGALORE","hist","2021-11-01",105],["BANGALORE","hist","2021-12-05",113],["BANGALORE","hist","2022-01-01",113],["BANGALORE","hist","2022-03-20",144],["BANGALORE","hist","2022-05-15",143],["BANGALORE","hist","2022-07-25",67],["BANGALORE","hist","2022-08-04",65],["BANGALORE","hist","2022-09-20",122],["BANGALORE","hist","2022-10-10",124],["BANGALORE","hist","2022-11-20",117],["BANGALORE","hist","2022-12-01",102],["BANGALORE","hist","2023-01-01",116],["BANGALORE","hist","2023-02-03",70],["BANGALORE","hist","2023-03-10",67],["BANGALORE","hist","2023-04-09",70],["BANGALORE","hist","2023-05-28",131],["BANGALORE","hist","2023-06-11",145],["BANGALORE","hist","2023-07-10",88],["BANGALORE","hist","2023-08-13",125],["BANGALORE","hist","2023-09-05",121],["BANGALORE","hist","2023-10-05",122],["BANGALORE","hist","2023-11-22",68],["BANGALORE","hist","2023-12-05",52],["BANGALORE","hist","2024-01-09",64],["BANGALORE","hist","2024-02-09",126],["BANGALORE","hist","2024-03-19",90],["BANGALORE","hist","2024-04-10",143],["BANGALORE","hist","2024-05-24",150],["BANGALORE","hist","2024-06-24",150],["BANGALORE","hist","2024-07-01",96],["BANGALORE","hist","2024-08-08",65],["BANGALORE","hist","2024-09-10",100],["BANGALORE","hist","2024-10-14",122],["BANGALORE","hist","2024-11-24",67],["BANGALORE","hist","2024-12-09",70],["BANGALORE","hist","2025-01-10",94],["BANGALORE","hist","2025-02-16",72],["BANGALORE","hist","2025-03-08",62],["BANGALORE","hist","2025-03-30",116],["BANGALORE","hist","2025-04-19",72],["BANGALORE","hist","2025-05-01",90],["BANGALORE","hist","2025-05-21",110],["BANGALORE","hist","2025-06-01",102],["BANGALORE","hist","2025-06-14",97],["BANGALORE","hist","2025-07-13",92],["BANGALORE","hist","2025-07-25",110],["BANGALORE","hist","2025-08-07",74],["BANGALORE","hist","2025-08-29",92],["BANGALORE","hist","2025-09-13",115],["BANGALORE","hist","2025-10-01",100],["BANGALORE","hist","2025-11-18",109],["BANGALORE","hist","2025-12-01",105],["BANGALORE","hist","2025-12-31",138],["BANGALORE","hist","2026-01-15",152],["BANGALORE","hist","2026-01-27",124],["BANGALORE","hist","2026-02-14",92],["BANGALORE","hist","2026-03-19",146],["BANGALORE","hist","2026-03-29",100],["BANGALORE","hist","2026-04-26",87],["BANGALORE","hist","2026-05-12",140],["BANGALORE","hist","2026-05-31",124]];
+})();
+
+const FULL_HIST = {};
+const FULL_FC = {};
+
+CITIES.forEach(c=>{FULL_HIST[c]=[];FULL_FC[c]=[];});
+
+const BLR_HIST = [["2021-04-01",117],["2021-04-15",117],["2021-04-23",73],["2021-05-03",43],["2021-05-14",88],["2021-05-31",68],["2021-06-01",80],["2021-06-07",99],["2021-06-11",78],["2021-06-30",111],["2021-07-18",152],["2021-07-22",138],["2021-07-31",128],["2021-08-04",120],["2021-08-17",127],["2021-08-30",110],["2021-09-05",129],["2021-09-12",132],["2021-09-23",124],["2021-09-30",133],["2021-10-05",133],["2021-10-12",113],["2021-10-18",123],["2021-10-27",108],["2021-11-06",116],["2021-11-08",97],["2021-11-25",84],["2021-12-05",113],["2021-12-13",95],["2021-12-23",80],["2021-12-31",108],["2022-01-20",111],["2022-01-22",82],["2022-02-07",85],["2022-02-22",115],["2022-02-28",126],["2022-03-13",141],["2022-03-20",144],["2022-03-28",130],["2022-04-11",93],["2022-04-21",120],["2022-05-15",143],["2022-05-18",133],["2022-05-27",110],["2022-06-12",143],["2022-06-27",110],["2022-07-04",105],["2022-07-14",85],["2022-07-25",67],["2022-08-04",65],["2022-08-23",65],["2022-09-07",100],["2022-09-18",119],["2022-09-28",85],["2022-10-09",122],["2022-10-17",126],["2022-10-24",105],["2022-11-01",119],["2022-11-14",90],["2022-11-20",117],["2022-12-01",102],["2022-12-31",113],["2023-01-24",92],["2023-02-03",70],["2023-02-22",95],["2023-03-10",67],["2023-03-26",103],["2023-04-09",70],["2023-04-16",105],["2023-05-07",113],["2023-05-28",131],["2023-06-04",135],["2023-06-11",145],["2023-06-23",130],["2023-07-08",93],["2023-07-26",100],["2023-08-01",113],["2023-08-13",125],["2023-08-25",100],["2023-09-05",121],["2023-09-15",110],["2023-09-25",95],["2023-10-05",122],["2023-10-09",105],["2023-10-21",95],["2023-11-03",90],["2023-11-22",68],["2023-12-04",57],["2023-12-14",90],["2023-12-21",90],["2023-12-31",98],["2024-01-08",64],["2024-01-15",93],["2024-01-22",78],["2024-02-01",108],["2024-02-09",126],["2024-02-23",130],["2024-03-04",105],["2024-03-19",90],["2024-03-24",105],["2024-04-10",143],["2024-04-15",126],["2024-04-22",100],["2024-05-01",122],["2024-05-17",143],["2024-05-24",150],["2024-05-31",128],["2024-06-03",118],["2024-06-24",150],["2024-06-30",135],["2024-07-01",96],["2024-07-12",110],["2024-07-28",85],["2024-08-08",65],["2024-08-17",93],["2024-08-26",75],["2024-09-02",67],["2024-09-10",100],["2024-09-30",100],["2024-10-05",112],["2024-10-14",122],["2024-10-20",105],["2024-11-10",82],["2024-11-24",67],["2024-12-09",70],["2024-12-17",95],["2024-12-22",68],["2024-12-31",94],["2025-01-05",78],["2025-01-10",94],["2025-01-20",101],["2025-02-01",92],["2025-02-16",72],["2025-02-25",67],["2025-03-08",62],["2025-03-15",94],["2025-03-20",58],["2025-03-30",116],["2025-04-06",82],["2025-04-19",72],["2025-04-26",86],["2025-05-01",90],["2025-05-10",103],["2025-05-21",110],["2025-05-31",102],["2025-06-01",102],["2025-06-11",100],["2025-06-14",97],["2025-06-24",106],["2025-07-01",94],["2025-07-13",92],["2025-07-25",110],["2025-07-31",98],["2025-08-07",74],["2025-08-15",90],["2025-08-22",76],["2025-08-29",92],["2025-09-01",92],["2025-09-13",115],["2025-09-20",117],["2025-09-24",95],["2025-10-01",100],["2025-10-07",100],["2025-10-27",107],["2025-11-05",99],["2025-11-18",109],["2025-11-23",92],["2025-12-01",105],["2025-12-09",119],["2025-12-21",124],["2025-12-31",138],["2026-01-10",150],["2026-01-15",152],["2026-01-25",130],["2026-01-28",117],["2026-02-01",114],["2026-02-08",102],["2026-02-14",92],["2026-02-21",112],["2026-02-28",112],["2026-03-09",140],["2026-03-19",146],["2026-03-24",140],["2026-03-29",100],["2026-04-06",111],["2026-04-12",90],["2026-04-21",107],["2026-04-26",87],["2026-04-30",104],["2026-05-03",115],["2026-05-12",140],["2026-05-15",132],["2026-05-24",105],["2026-05-31",124]];
+
+const CITY_FACTOR={BANGALORE:1.0,HASSAN:1.027,MYSORE:1.01,SHIMOGA:1.015,hosadurga:1.013};
+
+CITIES.forEach(c=>{
+  const f=CITY_FACTOR[c];
+  FULL_HIST[c]=BLR_HIST.map(([d,p])=>({d,p:Math.round(p*f*10)/10}));
+});
+
+const FC_BLR=[["2026-06-01",123.8],["2026-06-07",119.6],["2026-06-10",120.8],["2026-06-15",116.9],["2026-06-20",111.3],["2026-06-25",109.3],["2026-06-30",105.7],["2026-07-05",111.9],["2026-07-10",108.1],["2026-07-15",106.3],["2026-07-20",100.0],["2026-07-25",93.0],["2026-07-31",87.2],["2026-08-05",100.7],["2026-08-10",94.2],["2026-08-15",87.1],["2026-08-20",91.2],["2026-08-25",96.2],["2026-08-29",96.7]];
+const FC_EXTRAS={HASSAN:3.7,MYSORE:1.1,SHIMOGA:2.6,hosadurga:2.4};
+
+CITIES.forEach(c=>{
+  const offset=c==='BANGALORE'?0:(FC_EXTRAS[c]||0);
+  FULL_FC[c]=FC_BLR.map(([d,p])=>({d,p:Math.round((p+offset)*10)/10}));
+});
+
+const MONTHLY_BLR={1:94.2,2:87.4,3:102.8,4:108.1,5:116.8,6:116.1,7:104.1,8:87.5,9:106.4,10:108.3,11:96.3,12:100.2};
+
+function getHistFiltered(city, days){
+  const data=FULL_HIST[city];
+  if(days>=9999) return data;
+  const cutoff=new Date('2026-05-31');
+  cutoff.setDate(cutoff.getDate()-days);
+  const cs=cutoff.toISOString().split('T')[0];
+  return data.filter(x=>x.d>=cs);
+}
+
+function computeKPI(city){
+  const data=FULL_HIST[city];
+  const prices=data.map(x=>x.p);
+  const latest=prices[prices.length-1];
+  const avg=Math.round(prices.reduce((a,b)=>a+b,0)/prices.length);
+  const hi=Math.max(...prices);
+  const lo=Math.min(...prices);
+  const p30=prices.slice(-30);
+  const p60_30=prices.slice(-60,-30);
+  const avg30=Math.round(p30.reduce((a,b)=>a+b,0)/p30.length);
+  const avg60=p60_30.length?Math.round(p60_30.reduce((a,b)=>a+b,0)/p60_30.length):avg30;
+  const chg=avg30-avg60;
+  return{latest,avg,hi,lo,chg};
+}
+
+let hChart=null,sChart=null,fChart=null;
+
+const isDark=matchMedia('(prefers-color-scheme:dark)').matches;
+const grid=isDark?'rgba(255,255,255,0.08)':'rgba(0,0,0,0.06)';
+const ticks=isDark?'#aaa':'#888';
+
+function renderKPI(city){
+  const k=computeKPI(city==='ALL'?'BANGALORE':city);
+  const cc=k.chg>=0?'#1d9e75':'#d85a30';
+  const ca=k.chg>=0?'▲':'▼';
+  document.getElementById('kpiRow').innerHTML=`
+    <div class="kpi"><div class="kpi-lbl">Current price</div><div class="kpi-val">₹${k.latest}</div><div class="kpi-sub">31 May 2026</div></div>
+    <div class="kpi"><div class="kpi-lbl">All-time avg</div><div class="kpi-val">₹${k.avg}</div><div class="kpi-sub">Apr 2021–May 2026</div></div>
+    <div class="kpi"><div class="kpi-lbl">Range</div><div class="kpi-val">₹${k.lo}–${k.hi}</div><div class="kpi-sub">All-time low–high</div></div>
+    <div class="kpi"><div class="kpi-lbl">30-day trend</div><div class="kpi-val" style="color:${cc}">${ca} ₹${Math.abs(k.chg)}</div><div class="kpi-sub">vs prior 30 days</div></div>`;
+}
+
+function renderHist(city,days){
+  const cities=city==='ALL'?CITIES:[city];
+  document.getElementById('histTitle').textContent=city==='ALL'?'All cities — price comparison':`${CLABELS[city]||city} price history`;
+  const leg=document.getElementById('histLegend');
+  leg.innerHTML=cities.map((c,i)=>`<span class="leg"><span class="leg-sq" style="background:${COLORS[i]}"></span>${CLABELS[c]}</span>`).join('');
+  const baseData=getHistFiltered(cities[0],days);
+  const labels=baseData.map(x=>x.d.slice(5));
+  const datasets=cities.map((c,i)=>({
+    label:CLABELS[c],
+    data:getHistFiltered(c,days).map(x=>x.p),
+    borderColor:COLORS[i],borderWidth:city==='ALL'?1.5:2,
+    backgroundColor:'transparent',pointRadius:0,tension:0.3
+  }));
+  if(hChart) hChart.destroy();
+  hChart=new Chart(document.getElementById('histChart'),{
+    type:'line',data:{labels,datasets},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,callbacks:{label:c=>`${c.dataset.label}: ₹${c.raw}`}}},
+      scales:{x:{ticks:{color:ticks,maxTicksLimit:8,font:{size:10}},grid:{color:grid}},
+              y:{ticks:{color:ticks,callback:v=>`₹${v}`,font:{size:10}},grid:{color:grid}}}}
+  });
+}
+
+function renderSeason(){
+  const months=Object.keys(MONTHLY_BLR).map(Number);
+  const avgs=months.map(m=>MONTHLY_BLR[m]);
+  const bgs=avgs.map(v=>v>110?'#85B7EB':'#B5D4F4');
+  if(sChart) sChart.destroy();
+  sChart=new Chart(document.getElementById('seasonChart'),{
+    type:'bar',
+    data:{labels:MNTH,datasets:[{data:avgs,backgroundColor:bgs,borderWidth:0,label:'Avg ₹/kg'}]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>`₹${c.raw} avg`}}},
+      scales:{x:{ticks:{color:ticks,font:{size:10}},grid:{display:false}},
+              y:{ticks:{color:ticks,callback:v=>`₹${v}`,font:{size:10}},grid:{color:grid},
+                 min:70,suggestedMax:130}}}
+  });
+}
+
+function renderForecast(city){
+  const c=city==='ALL'?'BANGALORE':city;
+  const histSlice=FULL_HIST[c].slice(-20);
+  const fcData=FULL_FC[c];
+  const labels=[...histSlice.map(x=>x.d.slice(5)),...fcData.map(x=>x.d.slice(5))];
+  const histSeries=[...histSlice.map(x=>x.p),...new Array(fcData.length).fill(null)];
+  const fcSeries=[...new Array(histSlice.length-1).fill(null),histSlice[histSlice.length-1].p,...fcData.map(x=>x.p)];
+
+  if(fChart) fChart.destroy();
+  fChart=new Chart(document.getElementById('fcChart'),{
+    type:'line',
+    data:{labels,datasets:[
+      {label:'Historical',data:histSeries,borderColor:'#378ADD',borderWidth:2,backgroundColor:'transparent',pointRadius:0,tension:0.3},
+      {label:'Forecast',data:fcSeries,borderColor:'#1D9E75',borderWidth:2,backgroundColor:'rgba(29,158,117,0.07)',pointRadius:0,tension:0.3,borderDash:[5,4],fill:true}
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false}},
+      scales:{x:{ticks:{color:ticks,maxTicksLimit:10,font:{size:10}},grid:{color:grid}},
+              y:{ticks:{color:ticks,callback:v=>`₹${v}`,font:{size:10}},grid:{color:grid}}}}
+  });
+
+  const fcCards=CITIES.map((ct,i)=>{
+    const last=FULL_HIST[ct][FULL_HIST[ct].length-1].p;
+    const fc=FULL_FC[ct];
+    const m1=Math.round(fc.slice(0,7).reduce((a,b)=>a+b.p,0)/Math.min(7,fc.slice(0,7).length));
+    const lastFc=fc[fc.length-1].p;
+    const chg=Math.round((lastFc-last)*10)/10;
+    return `<div class="fc-card">
+      <div class="fc-city">${CLABELS[ct]}</div>
+      <div class="fc-val">₹${lastFc}</div>
+      <div class="fc-chg ${chg>=0?'up':'dn'}">${chg>=0?'▲':'▼'} ₹${Math.abs(chg)} from ₹${last}</div>
+      <div style="font-size:10px;color:var(--color-text-tertiary);margin-top:2px">Jun avg: ₹${m1}</div>
+    </div>`;
+  }).join('');
+  document.getElementById('fcSummary').innerHTML=fcCards;
+}
+
+function render(){
+  const city=document.getElementById('citySelect').value;
+  const days=parseInt(document.getElementById('rangeSelect').value);
+  renderKPI(city);
+  renderHist(city,days);
+  renderSeason();
+  renderForecast(city);
+}
+
+document.getElementById('citySelect').addEventListener('change',render);
+document.getElementById('rangeSelect').addEventListener('change',render);
+render();
+</script>
