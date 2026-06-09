@@ -5,7 +5,7 @@ api.py  — Plant Advisor
 =======================
 
 FastAPI streaming endpoint.
-
+ 
 Query audit logging:
 
   - BLOCKED_INPUT  → written by runner.py validate_query()
@@ -15,17 +15,17 @@ Query audit logging:
   - PASSED         → written here after full pipeline completes
 
   - ERROR          → written here on exception
-
+ 
 All records go to logs/queries.log (query_audit=True tag).
 
 """
-
+ 
 import os
 
 from dotenv import load_dotenv
-
+ 
 load_dotenv()
-
+ 
 from fastapi import FastAPI, Request, Body
 
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -37,7 +37,7 @@ import time
 import uuid
 
 import datetime
-
+ 
 from master_agent import agent_app, llm as _pipeline_llm
 
 from guard.runner import validate_query, validate_query_regex_only, validate_query_llama_tier
@@ -61,16 +61,21 @@ async def _detect_and_translate(query: str) -> tuple[str, str]:
     The english_query is fed into the guardrail AND pre-loaded into the
     LangGraph state so detect_lang / translate_in nodes are skipped.
     """
+    # Build a minimal state dict matching AgentState
     state: dict = {"user_query": query, "executed_nodes": []}
 
+    # Step 1 — detect language
     lang_result = _detect_language(state)
     state.update(lang_result)
 
     detected_lang = state.get("detected_lang", "English")
 
+    # Unsupported language — return raw query; pipeline will handle the
+    # final_response message set by detect_language.
     if detected_lang == "unsupported":
         return detected_lang, query
 
+    # Step 2 — translate if not English
     if detected_lang.lower() not in ["en", "english"]:
         trans_result = await _translate_to_english(state, _pipeline_llm)
         english_query = trans_result.get("english_query", query)
@@ -78,8 +83,7 @@ async def _detect_and_translate(query: str) -> tuple[str, str]:
         english_query = query
 
     return detected_lang, english_query
-
-
+ 
 # ── LangSmith tracing setup ─────────────────────────────────────────────────────
 # Uses RunTree for a single root run per request with child runs for every step.
 # This produces ONE clean trace with a full waterfall instead of multiple
@@ -99,105 +103,196 @@ except Exception:
     _ls_available = False
     RunTree        = None
     logger.warning("LangSmith not available — traces will not appear in dashboard")
-
+ 
 app = FastAPI()
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
+
 # Global guardrail toggle state
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+ 
 _guardrail_state = {
+
     "input_enabled":  True,
+
     "output_enabled": True,
+
 }
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
+
 # Guardrail management endpoints
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+ 
 @app.get("/guardrail/status")
+
 async def guardrail_status():
+
     return JSONResponse(content=_guardrail_state)
-
-
+ 
+ 
 @app.post("/guardrail/toggle")
+
 async def guardrail_toggle(payload: dict = Body(...)):
+
     guard_type = payload.get("type", "all")
+
     enabled    = payload.get("enabled", True)
-
+ 
     if guard_type in ("input", "all"):
+
         _guardrail_state["input_enabled"] = bool(enabled)
-        logger.info("Input guardrail toggled | enabled={}", _guardrail_state["input_enabled"])
 
+        logger.info(
+
+            "Input guardrail toggled | enabled={}",
+
+            _guardrail_state["input_enabled"],
+
+        )
+ 
     if guard_type in ("output", "all"):
+
         _guardrail_state["output_enabled"] = bool(enabled)
-        logger.info("Output guardrail toggled | enabled={}", _guardrail_state["output_enabled"])
 
+        logger.info(
+
+            "Output guardrail toggled | enabled={}",
+
+            _guardrail_state["output_enabled"],
+
+        )
+ 
     return JSONResponse(content={"status": "updated", "state": _guardrail_state})
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
+
 # LangSmith helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+ 
 def _parse_semantic_rule(rejection_msg: str) -> tuple[str, str, str]:
+
     """
+
     Extract tier, category, and decision from the rejection message.
+ 
+    runner.py embeds the rule in the block_rule field passed to _audit()
+
+    as "SemanticScopeChecker:BLOCK_OUT_OF_SCOPE" or
+
+    "SemanticHarmfulChecker:BYPASS_BMS".
+ 
+    The rejection_msg itself is the user-facing safety text, so we
+
+    infer tier from its content instead.
+ 
     Returns (tier, category, decision) — all strings for LangSmith tags.
+
     """
+
     msg = (rejection_msg or "").lower()
+ 
+    # Tier 1 messages always contain this phrase
 
     if "only answer questions about the aim" in msg:
+
         if "unrelated topic" in msg:
+
             return "Tier1_Semantic", "SCOPE", "BLOCK_OUT_OF_SCOPE"
+
         else:
+
             return "Tier1_Semantic", "SCOPE", "BLOCK_TOO_GENERIC"
+ 
+    # Tier 3 Llama Guard messages
 
     if "llama" in msg or "s1" in msg or "s2" in msg:
+
         return "Tier3_LlamaGuard", "LLAMA_GUARD", "BLOCK_HARMFUL"
+ 
+    # Tier 2 — map known safety warning keywords to category names
+
+    # These appear in the rejection messages defined in semantic_tier2_harmful_v3.py
 
     category_map = [
+
         ("steam explosion",           "WET_CHARGE"),
+
         ("moisture check",            "WET_CHARGE"),
+
         ("damp",                      "WET_CHARGE"),
+
         ("bms safety interlock",      "BYPASS_BMS"),
+
         ("burner management",         "BYPASS_BMS"),
+
         ("gas solenoid",              "FORCE_GAS_VALVE"),
+
         ("unburnt gas",               "FORCE_GAS_VALVE"),
+
         ("welding",                   "WELD_VESSEL"),
+
         ("drilling",                  "WELD_VESSEL"),
+
         ("furnace bay atmosphere",    "BREATHE_ATMOSPHERE"),
+
         ("respiratory",               "BREATHE_ATMOSPHERE"),
+
         ("cl2",                       "USE_CL2_NO_EXTRACT"),
+
         ("chlorine gas",              "USE_CL2_NO_EXTRACT"),
+
         ("fume extraction",           "USE_CL2_NO_EXTRACT"),
+
         ("shift metallurgist",        "CAST_OUT_OF_SPEC"),
+
         ("out-of-spec",               "CAST_OUT_OF_SPEC"),
+
         ("class f",                   "CHARGE_CLASS_F"),
+
         ("unknown alloy",             "CHARGE_CLASS_F"),
+
         ("magnesium",                 "MG_AFTER_FLUX"),
+
         ("salt flux",                 "MG_AFTER_FLUX"),
+
         ("casting pit",               "PIT_ENTRY_NO_PERMIT"),
+
         ("permit to work",            "PIT_ENTRY_NO_PERMIT"),
+
         ("loto",                      "MAINTENANCE_NO_LOTO"),
+
         ("lockout",                   "MAINTENANCE_NO_LOTO"),
+
         ("sabotage",                  "SABOTAGE"),
+
         ("emergency stop",            "SABOTAGE"),
+
         ("falsify",                   "FRAUD_FALSIFICATION"),
+
         ("quality records",           "FRAUD_FALSIFICATION"),
+
         ("process limit",             "VIOLATE_PROCESS_LIMIT"),
+
         ("process limits",            "VIOLATE_PROCESS_LIMIT"),
+
     ]
 
     for keyword, category in category_map:
+
         if keyword in msg:
+
             return "Tier2_Semantic", category, "BLOCK_HARMFUL"
-
+ 
     return "Tier2_Semantic", "UNKNOWN", "BLOCK_HARMFUL"
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # LangSmith RunTree tracing
 # ONE root run per request with child spans for every pipeline step.
@@ -205,9 +300,9 @@ def _parse_semantic_rule(rejection_msg: str) -> tuple[str, str, str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_root_run(
-    run_id: str,
-    query:  str,
-    tags:   list[str],
+    run_id:     str,
+    query:      str,
+    tags:       list[str],
 ) -> "RunTree | None":
     """
     Create and post the root RunTree span for this request.
@@ -233,11 +328,11 @@ def _make_root_run(
 
 
 def _child(
-    root:     "RunTree | None",
-    name:     str,
-    run_type: str,
-    inputs:   dict,
-    tags:     list[str] | None = None,
+    root:       "RunTree | None",
+    name:       str,
+    run_type:   str,
+    inputs:     dict,
+    tags:       list[str] | None = None,
 ) -> "RunTree | None":
     """
     Create and post a child span under root.
@@ -323,9 +418,9 @@ def _trace_blocked_query(
             tier, category, decision = _parse_semantic_rule(block_reason)
 
         tags = ["blocked", f"{stage}_guardrail", block_rule]
-        if tier:                              tags.append(tier)
+        if tier:          tags.append(tier)
         if category and category != "UNKNOWN": tags.append(category)
-        if decision:                          tags.append(decision)
+        if decision:      tags.append(decision)
         if harm_score is not None:
             if   harm_score >= 0.90: tags.append("score_very_high")
             elif harm_score >= 0.75: tags.append("score_high")
@@ -363,9 +458,12 @@ def _trace_blocked_query(
         )
 
         if root is not None:
+            # Attach as child span so it appears in the waterfall
             child = _child(root, f"guardrail_blocked:{stage}", "chain", inputs, tags)
             _end_child(child, outputs, error=error_str)
         else:
+            # Standalone run (backwards compat for output-guardrail blocks
+            # where root may not be available)
             now = datetime.datetime.utcnow()
             _ls_client.create_run(
                 name=f"plant-advisor-{run_id}",
@@ -382,8 +480,8 @@ def _trace_blocked_query(
         logger.debug(
             "LangSmith blocked trace | run_id={} tier={} category={} score_in={} harm_score={}",
             run_id, tier, category,
-            f"{score_in:.3f}" if score_in is not None else "—",
-            f"{harm_score:.3f}" if harm_score is not None else "—",
+            f"{score_in:.3f}" if score_in is not None else "â",
+            f"{harm_score:.3f}" if harm_score is not None else "â",
         )
     except Exception as e:
         logger.warning("LangSmith trace failed | run_id={} error={}", run_id, str(e))
@@ -403,7 +501,7 @@ def _trace_passed_query(
         return
     try:
         tags = ["passed", "input_guardrail"]
-        if score_in is not None and score_in < 0.50:      tags.append("t1_near_miss")
+        if score_in is not None and score_in < 0.50:  tags.append("t1_near_miss")
         if harm_score is not None and harm_score >= 0.55: tags.append("t2_near_miss")
 
         outputs = {
@@ -435,52 +533,88 @@ def _trace_passed_query(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+
 # Audit writer — for OUTPUT guardrail results and PASSED / ERROR outcomes
+
 # Input guardrail audit is written inside runner.py validate_query()
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+ 
 def _write_audit(
+
     run_id:           str,
+
     query:            str,
+
     status:           str,
+
     block_stage:      str  | None,
+
     block_rule:       str  | None,
+
     block_reason:     str  | None,
+
     detected_lang:    str  | None,
+
     chunks_retrieved: int,
+
     latency_ms:       int,
+
     input_guard_on:   bool,
+
     output_guard_on:  bool,
+
     llm_response:     str  | None = None,
+
 ) -> None:
+
     logger.bind(query_audit=True).info(
+
         "QUERY_AUDIT",
+
         run_id=run_id,
+
         query=query,
+
         status=status,
+
         block_stage=block_stage,
+
         block_rule=block_rule,
+
         block_reason=block_reason,
+
         llm_response=llm_response,
+
         detected_lang=detected_lang,
+
         chunks_retrieved=chunks_retrieved,
+
         latency_ms=latency_ms,
+
         input_guard_on=input_guard_on,
+
         output_guard_on=output_guard_on,
+
     )
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
+
 # Main streaming endpoint
+
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 @app.get("/stream")
+
 async def stream(query: str, request: Request):
-
+ 
     run_id           = str(uuid.uuid4())[:8]
-    run_input_guard  = _guardrail_state["input_enabled"]
-    run_output_guard = _guardrail_state["output_enabled"]
 
+    run_input_guard  = _guardrail_state["input_enabled"]
+
+    run_output_guard = _guardrail_state["output_enabled"]
+ 
     async def generator():
 
         start            = time.time()
@@ -498,6 +632,12 @@ async def stream(query: str, request: Request):
         # ── Create root LangSmith RunTree span ───────────────────────────────
         # ONE root run per request. Every step below is a child of this span.
         # This eliminates the stray "OllamaChat" runs LangChain emits separately.
+        root_tags = [
+            "plant-advisor",
+            f"lang:{detected_lang_hint if False else 'pending'}",
+            "input_guard:on" if run_input_guard  else "input_guard:off",
+            "output_guard:on" if run_output_guard else "output_guard:off",
+        ]
         root_rt = _make_root_run(run_id=run_id, query=query, tags=["plant-advisor"])
 
         try:
@@ -546,8 +686,8 @@ async def stream(query: str, request: Request):
             if root_rt is not None:
                 try:
                     root_rt.inputs.update({
-                        "detected_lang": detected_lang,
-                        "english_query": english_query,
+                        "detected_lang":  detected_lang,
+                        "english_query":  english_query,
                     })
                 except Exception:
                     pass
@@ -568,9 +708,9 @@ async def stream(query: str, request: Request):
                     "metadata": [],
                 }) + "\n"
                 _end_root(root_rt, {
-                    "final_response": unsupported_msg,
-                    "outcome":        "UNSUPPORTED_LANGUAGE",
-                    "latency_ms":     round((time.time() - start) * 1000),
+                    "final_response":  unsupported_msg,
+                    "outcome":         "UNSUPPORTED_LANGUAGE",
+                    "latency_ms":      round((time.time() - start) * 1000),
                 }, tags=["unsupported_language"])
                 return
 
@@ -596,7 +736,7 @@ async def stream(query: str, request: Request):
 
             if run_input_guard:
 
-                # ── Tier 1 ───────────────────────────────────────────────────
+                # ── Tier 1 ──────────────────────────────────────────────────
                 t1_start = time.time()
                 child_t1 = _child(
                     child_guard, "tier1_scope_check", "chain",
@@ -614,14 +754,14 @@ async def stream(query: str, request: Request):
                     _t1_latency_ms = round((time.time() - t1_start) * 1000)
 
                     _end_child(child_t1, {
-                        "decision":    t1.decision,
-                        "score_in":    round(t1.score_in_scope, 3),
-                        "score_out":   round(t1.score_out_scope, 3),
-                        "margin":      round(t1.margin, 3),
-                        "matched_in":  t1.matched_in,
-                        "matched_out": t1.matched_out,
-                        "latency_ms":  _t1_latency_ms,
-                        "passed":      t1.passed,
+                        "decision":      t1.decision,
+                        "score_in":      round(t1.score_in_scope, 3),
+                        "score_out":     round(t1.score_out_scope, 3),
+                        "margin":        round(t1.margin, 3),
+                        "matched_in":    t1.matched_in,
+                        "matched_out":   t1.matched_out,
+                        "latency_ms":    _t1_latency_ms,
+                        "passed":        t1.passed,
                     }, error=None if t1.passed else f"BLOCKED:{t1.decision}")
 
                     if not t1.passed:
@@ -633,7 +773,7 @@ async def stream(query: str, request: Request):
                             run_id, t1.decision, t1.score_in_scope, t1.score_out_scope,
                         )
                     else:
-                        # ── Tier 2 ───────────────────────────────────────────
+                        # ── Tier 2 ──────────────────────────────────────────
                         t2_start = time.time()
                         child_t2 = _child(
                             child_guard, "tier2_harmful_check", "chain",
@@ -674,7 +814,7 @@ async def stream(query: str, request: Request):
 
                 except Exception as e:
                     logger.error(
-                        "Direct checker access failed | run_id={} error={} — falling back",
+                        "Direct checker access failed | run_id={} error={} â falling back",
                         run_id, str(e),
                     )
                     passed, rejection_msg = validate_query_regex_only(
@@ -688,8 +828,8 @@ async def stream(query: str, request: Request):
                 if passed and not _t2_safe_pass:
                     from guard.llama_guard import _check_model_available
                     if _check_model_available():
-                        t3_start = time.time()
-                        child_t3 = _child(
+                        t3_start  = time.time()
+                        child_t3  = _child(
                             child_guard, "tier3_llama_guard", "llm",
                             {"english_query": english_query, "safe_passage_skipped": False},
                             tags=["tier3", "llama_guard"],
@@ -715,7 +855,7 @@ async def stream(query: str, request: Request):
                             tier = "Tier3_LlamaGuard"; category = "LLAMA_GUARD"; decision = "BLOCK_HARMFUL"
 
                 elif passed and _t2_safe_pass:
-                    # Tier 3 skipped — visible as a child span so it's clear why
+                    # Tier 3 skipped — log this as a child span so it's visible
                     child_t3_skip = _child(
                         child_guard, "tier3_llama_guard_SKIPPED", "chain",
                         {"reason": "safe_passage=True from Tier2"},
@@ -742,28 +882,28 @@ async def stream(query: str, request: Request):
                     input_block_rule = "Guardrail:UNKNOWN"
 
                 _end_child(child_guard, {
-                    "passed":           False,
-                    "tier":             tier,
-                    "category":         category,
-                    "decision":         decision,
-                    "t1_score_in":      _t1_score_in,
-                    "t1_score_out":     _t1_score_out,
-                    "t1_latency_ms":    _t1_latency_ms,
-                    "t2_harm_score":    _t2_harm_score,
-                    "t2_latency_ms":    _t2_latency_ms,
-                    "t3_latency_ms":    _t3_latency_ms,
+                    "passed":      False,
+                    "tier":        tier,
+                    "category":    category,
+                    "decision":    decision,
+                    "t1_score_in": _t1_score_in,
+                    "t1_score_out":_t1_score_out,
+                    "t1_latency_ms": _t1_latency_ms,
+                    "t2_harm_score": _t2_harm_score,
+                    "t2_latency_ms": _t2_latency_ms,
+                    "t3_latency_ms": _t3_latency_ms,
                     "total_latency_ms": t_guard_ms,
-                    "block_rule":       input_block_rule,
-                    "block_reason":     (rejection_msg or "")[:300],
+                    "block_rule":  input_block_rule,
+                    "block_reason": (rejection_msg or "")[:300],
                 }, error=f"BLOCKED:{tier}:{category}")
 
                 log.warning(
                     "Input guardrail blocked | run_id={} tier={} category={} "
                     "score_in={} score_out={} harm_score={} reason={}",
-                    run_id, tier or "unknown", category or "—",
-                    f"{_t1_score_in:.3f}"   if _t1_score_in   is not None else "—",
-                    f"{_t1_score_out:.3f}"  if _t1_score_out  is not None else "—",
-                    f"{_t2_harm_score:.3f}" if _t2_harm_score is not None else "—",
+                    run_id, tier or "unknown", category or "â",
+                    f"{_t1_score_in:.3f}"   if _t1_score_in   is not None else "â",
+                    f"{_t1_score_out:.3f}"  if _t1_score_out  is not None else "â",
+                    f"{_t2_harm_score:.3f}" if _t2_harm_score is not None else "â",
                     (rejection_msg or "")[:200],
                 )
 
@@ -780,11 +920,11 @@ async def stream(query: str, request: Request):
                 )
 
                 _end_root(root_rt, {
-                    "outcome":      "BLOCKED_INPUT",
-                    "tier":         tier,
-                    "category":     category,
-                    "latency_ms":   round(latency_input_blocked * 1000),
-                    "block_reason": (rejection_msg or "")[:300],
+                    "outcome":         "BLOCKED_INPUT",
+                    "tier":            tier,
+                    "category":        category,
+                    "latency_ms":      round(latency_input_blocked * 1000),
+                    "block_reason":    (rejection_msg or "")[:300],
                 }, tags=["blocked", "input_guardrail", tier or ""])
 
                 yield json.dumps({"type": "guardrail_blocked", "node": "guardrail", "message": rejection_msg}) + "\n"
@@ -799,14 +939,14 @@ async def stream(query: str, request: Request):
 
             # Guardrail passed
             _end_child(child_guard, {
-                "passed":           True,
-                "t1_score_in":      _t1_score_in,
-                "t1_score_out":     _t1_score_out,
-                "t1_latency_ms":    _t1_latency_ms,
-                "t2_harm_score":    _t2_harm_score,
-                "t2_safe_passage":  _t2_safe_pass,
-                "t2_latency_ms":    _t2_latency_ms,
-                "t3_latency_ms":    _t3_latency_ms,
+                "passed":          True,
+                "t1_score_in":     _t1_score_in,
+                "t1_score_out":    _t1_score_out,
+                "t1_latency_ms":   _t1_latency_ms,
+                "t2_harm_score":   _t2_harm_score,
+                "t2_safe_passage": _t2_safe_pass,
+                "t2_latency_ms":   _t2_latency_ms,
+                "t3_latency_ms":   _t3_latency_ms,
                 "total_latency_ms": t_guard_ms,
             })
 
@@ -851,9 +991,9 @@ async def stream(query: str, request: Request):
                     state_input,
                     version="v2",
                     config={
-                        "run_name": f"plant-advisor-{run_id}",
-                        "tags":     [f"run_id:{run_id}"],
-                        "metadata": {
+                        "run_name":   f"plant-advisor-{run_id}",
+                        "tags":       [f"run_id:{run_id}"],
+                        "metadata":   {
                             "run_id":      run_id,
                             # Linking metadata — LangSmith uses this to attach
                             # LangGraph's internal spans as children of our root.
@@ -871,10 +1011,7 @@ async def stream(query: str, request: Request):
                         node_inputs = event["data"].get("input") or {}
                         _node_children[name] = _child(
                             child_pipeline, name, "chain",
-                            inputs={
-                                "node": name,
-                                "input_keys": list(node_inputs.keys()) if isinstance(node_inputs, dict) else [],
-                            },
+                            inputs={"node": name, "input_keys": list(node_inputs.keys()) if isinstance(node_inputs, dict) else []},
                             tags=[name, "pipeline_node"],
                         )
                         yield json.dumps({"type": "node", "node": name}) + "\n"
@@ -885,10 +1022,7 @@ async def stream(query: str, request: Request):
                             current_state.update(output)
 
                         node_ms  = round((time.time() - _node_start_times.get(name, time.time())) * 1000)
-                        node_out = (
-                            {k: str(v)[:200] for k, v in output.items() if v is not None}
-                            if isinstance(output, dict) else {}
-                        )
+                        node_out = {k: str(v)[:200] for k, v in (output or {}).items() if v is not None} if isinstance(output, dict) else {}
                         node_out["latency_ms"] = node_ms
 
                         _end_child(_node_children.get(name), node_out)
@@ -909,20 +1043,18 @@ async def stream(query: str, request: Request):
                             if not run_output_guard:
                                 yield json.dumps({"type": "token", "content": final_answer}) + "\n"
 
-                    # LLM usage metrics — token counts + generation speed
+                    # LLM usage metrics — capture token counts + speed from LLM end events
                     if kind == "on_chat_model_end":
                         llm_output = event["data"].get("output")
                         if llm_output and hasattr(llm_output, "generations"):
                             try:
-                                gen               = llm_output.generations[0][0]
-                                usage             = getattr(gen.message, "usage_metadata", None) or {}
+                                gen = llm_output.generations[0][0]
+                                usage = getattr(gen.message, "usage_metadata", None) or {}
                                 prompt_tokens     = usage.get("input_tokens",  0)
                                 completion_tokens = usage.get("output_tokens", 0)
                                 total_tokens      = usage.get("total_tokens",  prompt_tokens + completion_tokens)
                                 llm_elapsed       = round((time.time() - start) * 1000)
-                                tokens_per_sec    = round(
-                                    completion_tokens / max(llm_elapsed / 1000, 0.001), 1
-                                ) if completion_tokens else None
+                                tokens_per_sec    = round(completion_tokens / max(llm_elapsed / 1000, 0.001), 1) if completion_tokens else None
 
                                 child_llm = _child(
                                     child_pipeline, "llm_call", "llm",
@@ -960,7 +1092,7 @@ async def stream(query: str, request: Request):
 
             if not final_answer:
                 final_answer = (
-                    "ℹ️ No relevant information was found in the manual "
+                    "\u2139\ufe0f No relevant information was found in the manual "
                     "for your query. Please rephrase or ask about a specific "
                     "AIM system component, fault, or procedure."
                 )
@@ -981,17 +1113,13 @@ async def stream(query: str, request: Request):
                     tags=["guardrail", "output"],
                 )
 
-                child_out_regex = _child(
-                    child_outguard, "output_regex_check", "chain",
-                    {"response_len": len(final_answer)},
-                    tags=["regex"],
-                )
-                out_passed_r, out_msg_r = validate_output_regex_only(final_answer)
-                _end_child(child_out_regex, {"passed": out_passed_r, "msg": out_msg_r or ""})
-
+                # Regex check child
+                # Regex/keyword check removed — LlamaGuard is the sole output check.
+                # Fast-paths (refusal + safe structured response) are handled inside
+                # classify_output() before LlamaGuard is called.
                 yield json.dumps({"type": "node_done", "node": "output_guardrail"}) + "\n"
-                out_passed = out_passed_r
-                out_msg    = out_msg_r
+                out_passed = True
+                out_msg    = None
 
                 if out_passed:
                     from guard.llama_guard import _check_model_available, classify_output
@@ -1046,10 +1174,10 @@ async def stream(query: str, request: Request):
                         decision="BLOCK_OUTPUT", root=root_rt,
                     )
                     _end_root(root_rt, {
-                        "outcome":      "BLOCKED_OUTPUT",
-                        "latency_ms":   round(latency * 1000),
-                        "ttft_ms":      round(ttft * 1000),
-                        "block_reason": (out_msg or "")[:300],
+                        "outcome":        "BLOCKED_OUTPUT",
+                        "latency_ms":     round(latency * 1000),
+                        "ttft_ms":        round(ttft * 1000),
+                        "block_reason":   (out_msg or "")[:300],
                     }, tags=["blocked", "output_guardrail"])
 
                     yield json.dumps({"type": "output_guardrail_blocked", "node": "output_guardrail", "message": out_msg}) + "\n"
@@ -1082,7 +1210,7 @@ async def stream(query: str, request: Request):
             )
 
             # ── Finalise root run with full metrics ───────────────────────────
-            chunks_meta       = current_state.get("retrieval_metadata", [])
+            chunks_meta = current_state.get("retrieval_metadata", [])
             prompt_tokens     = current_state.get("prompt_tokens",     0)
             completion_tokens = current_state.get("completion_tokens", 0)
             tokens_per_sec    = round(
@@ -1090,29 +1218,29 @@ async def stream(query: str, request: Request):
             ) if completion_tokens else None
 
             _end_root(root_rt, {
-                "outcome":           "PASSED",
-                "final_response":    final_answer[:500],
-                "detected_lang":     detected_lang,
-                "english_query":     english_query,
-                # ── Timing ───────────────────────────────────────────────
-                "total_latency_ms":  round(latency * 1000),
-                "ttft_ms":           round(ttft * 1000),
-                "tokens_per_sec":    tokens_per_sec,
+                "outcome":              "PASSED",
+                "final_response":       final_answer[:500],
+                "detected_lang":        detected_lang,
+                "english_query":        english_query,
+                # ── Timing waterfall ──────────────────────────────────────
+                "total_latency_ms":     round(latency * 1000),
+                "ttft_ms":              round(ttft * 1000),
+                "tokens_per_sec":       tokens_per_sec,
                 # ── Guardrail scores ──────────────────────────────────────
-                "t1_score_in":       _t1_score_in,
-                "t1_score_out":      _t1_score_out,
-                "t1_latency_ms":     _t1_latency_ms,
-                "t2_harm_score":     _t2_harm_score,
-                "t2_safe_passage":   _t2_safe_pass,
-                "t2_latency_ms":     _t2_latency_ms,
-                "t3_latency_ms":     _t3_latency_ms,
+                "t1_score_in":          _t1_score_in,
+                "t1_score_out":         _t1_score_out,
+                "t1_latency_ms":        _t1_latency_ms,
+                "t2_harm_score":        _t2_harm_score,
+                "t2_safe_passage":      _t2_safe_pass,
+                "t2_latency_ms":        _t2_latency_ms,
+                "t3_latency_ms":        _t3_latency_ms,
                 # ── Retrieval ────────────────────────────────────────────
-                "chunks_retrieved":  len(chunks_meta),
-                "chunk_scores":      [round(m.get("score", 0), 3) for m in chunks_meta[:5]],
-                "chunk_sources":     [m.get("source", "") for m in chunks_meta[:5]],
+                "chunks_retrieved":     len(chunks_meta),
+                "chunk_scores":         [round(m.get("score", 0), 3) for m in chunks_meta[:5]],
+                "chunk_sources":        [m.get("source", "") for m in chunks_meta[:5]],
                 # ── LLM metrics ──────────────────────────────────────────
-                "prompt_tokens":     prompt_tokens,
-                "completion_tokens": completion_tokens,
+                "prompt_tokens":        prompt_tokens,
+                "completion_tokens":    completion_tokens,
             }, tags=["passed"])
 
             yield json.dumps({
@@ -1134,3 +1262,4 @@ async def stream(query: str, request: Request):
             yield json.dumps({"type": "error", "message": f"Stream crashed: {str(e)}"}) + "\n"
 
     return StreamingResponse(generator(), media_type="application/x-ndjson")
+ 
