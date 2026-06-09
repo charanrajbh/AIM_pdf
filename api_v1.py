@@ -44,7 +44,7 @@ from guard.runner import validate_query, validate_query_regex_only, validate_que
 
 from guard.output_guardrail import validate_output, validate_output_regex_only
 
-from logger import logger
+from logger import logger, print_request_waterfall
 
 # ── Pre-guardrail translation helpers ────────────────────────────────────────
 # We run detect_lang + translate_in BEFORE the guardrail so the semantic
@@ -605,26 +605,6 @@ def _write_audit(
 
 # ─────────────────────────────────────────────────────────────────────────────
  
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DB knowledge-base endpoints — MySQL integration removed.
-# These stubs keep app.py happy without raising 404 / connection errors.
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/db/status")
-async def db_status():
-    """Always reports DB as disabled (MySQL integration removed)."""
-    return JSONResponse(content={"enabled": False})
-
-
-@app.post("/db/toggle")
-async def db_toggle(payload: dict = Body(...)):
-    """Accepts toggle requests but takes no action (MySQL integration removed)."""
-    logger.info("DB toggle received but MySQL integration is removed | payload={}", payload)
-    return JSONResponse(content={"status": "ignored", "enabled": False, "message": "MySQL integration has been removed."})
-
-
 @app.get("/stream")
 
 async def stream(query: str, request: Request):
@@ -947,6 +927,33 @@ async def stream(query: str, request: Request):
                     "block_reason":    (rejection_msg or "")[:300],
                 }, tags=["blocked", "input_guardrail", tier or ""])
 
+                # ── Terminal waterfall for blocked input ─────────────────
+                print_request_waterfall(
+                    run_id=run_id,
+                    query=query,
+                    detected_lang=detected_lang or "unknown",
+                    input_guard_on=run_input_guard,
+                    output_guard_on=run_output_guard,
+                    guard_passed=False,
+                    t1_score_in=_t1_score_in,
+                    t1_score_out=_t1_score_out,
+                    t1_latency_ms=_t1_latency_ms,
+                    t2_harm_score=_t2_harm_score,
+                    t2_safe_pass=_t2_safe_pass,
+                    t2_latency_ms=_t2_latency_ms,
+                    t3_latency_ms=_t3_latency_ms,
+                    block_tier=tier,
+                    block_category=category,
+                    block_reason=rejection_msg,
+                    node_timings={},
+                    chunks_retrieved=0,
+                    chunk_scores=[],
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    ttft_ms=round(latency_input_blocked * 1000),
+                    total_latency_ms=round(latency_input_blocked * 1000),
+                    outcome="BLOCKED_INPUT",
+                )
                 yield json.dumps({"type": "guardrail_blocked", "node": "guardrail", "message": rejection_msg}) + "\n"
                 yield json.dumps({
                     "type": "done",
@@ -988,6 +995,7 @@ async def stream(query: str, request: Request):
 
             # Per-node timing for waterfall
             _node_start_times: dict[str, float] = {}
+            _node_timings:     dict[str, int]   = {}
             _node_children:    dict[str, "RunTree | None"] = {}
 
             # Pipeline-level child span
@@ -1042,6 +1050,7 @@ async def stream(query: str, request: Request):
                             current_state.update(output)
 
                         node_ms  = round((time.time() - _node_start_times.get(name, time.time())) * 1000)
+                        _node_timings[name] = node_ms
                         node_out = {k: str(v)[:200] for k, v in (output or {}).items() if v is not None} if isinstance(output, dict) else {}
                         node_out["latency_ms"] = node_ms
 
@@ -1200,6 +1209,36 @@ async def stream(query: str, request: Request):
                         "block_reason":   (out_msg or "")[:300],
                     }, tags=["blocked", "output_guardrail"])
 
+                    # ── Terminal waterfall for blocked output ─────────────
+                    _wf_chunks_meta2 = current_state.get("retrieval_metadata", [])
+                    _wf_pt2  = current_state.get("prompt_tokens",     0) or 0
+                    _wf_ct2  = current_state.get("completion_tokens", 0) or 0
+                    print_request_waterfall(
+                        run_id=run_id,
+                        query=query,
+                        detected_lang=detected_lang or "unknown",
+                        input_guard_on=run_input_guard,
+                        output_guard_on=run_output_guard,
+                        guard_passed=False,
+                        t1_score_in=_t1_score_in,
+                        t1_score_out=_t1_score_out,
+                        t1_latency_ms=_t1_latency_ms,
+                        t2_harm_score=_t2_harm_score,
+                        t2_safe_pass=_t2_safe_pass,
+                        t2_latency_ms=_t2_latency_ms,
+                        t3_latency_ms=_t3_latency_ms,
+                        block_tier="OutputGuardrail",
+                        block_category="HARMFUL_RESPONSE",
+                        block_reason=out_msg,
+                        node_timings=_node_timings,
+                        chunks_retrieved=len(_wf_chunks_meta2),
+                        chunk_scores=[round(m.get("rerank_score", 0) or 0, 3) for m in _wf_chunks_meta2[:5]],
+                        prompt_tokens=_wf_pt2,
+                        completion_tokens=_wf_ct2,
+                        ttft_ms=round(ttft * 1000),
+                        total_latency_ms=round(latency * 1000),
+                        outcome="BLOCKED_OUTPUT",
+                    )
                     yield json.dumps({"type": "output_guardrail_blocked", "node": "output_guardrail", "message": out_msg}) + "\n"
                     yield json.dumps({
                         "type": "done", "latency": latency, "ttft": ttft,
@@ -1219,6 +1258,37 @@ async def stream(query: str, request: Request):
             log.info(
                 "Request done | latency={}s ttft={}s chunks={} lang={}",
                 latency, ttft, len(metadata), detected_lang or "unknown",
+            )
+
+            # ── Terminal waterfall — printed after every completed request ────
+            _wf_chunks_meta = current_state.get("retrieval_metadata", [])
+            _wf_pt  = current_state.get("prompt_tokens",     0) or 0
+            _wf_ct  = current_state.get("completion_tokens", 0) or 0
+            print_request_waterfall(
+                run_id=run_id,
+                query=query,
+                detected_lang=detected_lang or "unknown",
+                input_guard_on=run_input_guard,
+                output_guard_on=run_output_guard,
+                guard_passed=True,
+                t1_score_in=_t1_score_in,
+                t1_score_out=_t1_score_out,
+                t1_latency_ms=_t1_latency_ms,
+                t2_harm_score=_t2_harm_score,
+                t2_safe_pass=_t2_safe_pass,
+                t2_latency_ms=_t2_latency_ms,
+                t3_latency_ms=_t3_latency_ms,
+                block_tier=None,
+                block_category=None,
+                block_reason=None,
+                node_timings=_node_timings,
+                chunks_retrieved=len(_wf_chunks_meta),
+                chunk_scores=[round(m.get("rerank_score", 0) or 0, 3) for m in _wf_chunks_meta[:5]],
+                prompt_tokens=_wf_pt,
+                completion_tokens=_wf_ct,
+                ttft_ms=round(ttft * 1000),
+                total_latency_ms=round(latency * 1000),
+                outcome="PASSED",
             )
 
             _write_audit(
