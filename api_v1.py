@@ -605,6 +605,26 @@ def _write_audit(
 
 # ─────────────────────────────────────────────────────────────────────────────
  
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DB knowledge-base endpoints — MySQL integration removed.
+# These stubs keep app.py happy without raising 404 / connection errors.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/db/status")
+async def db_status():
+    """Always reports DB as disabled (MySQL integration removed)."""
+    return JSONResponse(content={"enabled": False})
+
+
+@app.post("/db/toggle")
+async def db_toggle(payload: dict = Body(...)):
+    """Accepts toggle requests but takes no action (MySQL integration removed)."""
+    logger.info("DB toggle received but MySQL integration is removed | payload={}", payload)
+    return JSONResponse(content={"status": "ignored", "enabled": False, "message": "MySQL integration has been removed."})
+
+
 @app.get("/stream")
 
 async def stream(query: str, request: Request):
