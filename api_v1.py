@@ -1058,7 +1058,9 @@ async def stream(query: str, request: Request):
                         log.debug("Node done | node={} latency_ms={}", name, node_ms)
                         yield json.dumps({"type": "node_done", "node": name}) + "\n"
 
-                    # Token streaming
+                    # Token streaming — always stream to UI regardless of output guard.
+                    # The output guard runs after full generation and sends a
+                    # "replace" event to overwrite the already-streamed text if blocked.
                     if kind == "on_chat_model_stream" and "final_node" in tags:
                         chunk = event["data"].get("chunk")
                         if chunk and hasattr(chunk, "content") and chunk.content:
@@ -1066,11 +1068,9 @@ async def stream(query: str, request: Request):
                                 first_token_time = time.time()
                                 ttft_val = round(first_token_time - start, 3)
                                 log.debug("First token | ttft={}s", ttft_val)
-                                if not run_output_guard:
-                                    yield json.dumps({"type": "start"}) + "\n"
+                                yield json.dumps({"type": "start"}) + "\n"
                             final_answer += chunk.content
-                            if not run_output_guard:
-                                yield json.dumps({"type": "token", "content": final_answer}) + "\n"
+                            yield json.dumps({"type": "token", "content": chunk.content}) + "\n"
 
                     # LLM usage metrics — capture token counts + speed from LLM end events
                     if kind == "on_chat_model_end":
@@ -1248,8 +1248,7 @@ async def stream(query: str, request: Request):
 
                 _end_child(child_outguard, {"passed": True, "latency_ms": t_outguard_ms})
                 log.info("Output guardrail passed")
-                yield json.dumps({"type": "start"}) + "\n"
-                yield json.dumps({"type": "token", "content": final_answer}) + "\n"
+                # Tokens were already streamed live — nothing more to send here.
 
             # ── Done ─────────────────────────────────────────────────────────
             latency = round(time.time() - start, 3)
