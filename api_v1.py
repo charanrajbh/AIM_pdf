@@ -1,6 +1,3 @@
-I need the truncated section (lines 1191–1260). Let me get that:Now I have everything. Here's the complete `api.py`:
-
-```python
 """
 
 api.py  — Plant Advisor
@@ -22,13 +19,13 @@ Query audit logging:
 All records go to logs/queries.log (query_audit=True tag).
 
 """
-
+ 
 import os
 
 from dotenv import load_dotenv
-
+ 
 load_dotenv()
-
+ 
 from fastapi import FastAPI, Request, Body
 
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -40,7 +37,7 @@ import time
 import uuid
 
 import datetime
-
+ 
 from master_agent import agent_app, llm as _pipeline_llm
 
 from guard.runner import validate_query, validate_query_regex_only, validate_query_llama_tier
@@ -61,15 +58,24 @@ async def _detect_and_translate(query: str) -> tuple[str, str]:
     """
     Run language detection + translation outside of LangGraph.
     Returns (detected_lang, english_query).
+    The english_query is fed into the guardrail AND pre-loaded into the
+    LangGraph state so detect_lang / translate_in nodes are skipped.
     """
+    # Build a minimal state dict matching AgentState
     state: dict = {"user_query": query, "executed_nodes": []}
+
+    # Step 1 — detect language
     lang_result = _detect_language(state)
     state.update(lang_result)
+
     detected_lang = state.get("detected_lang", "English")
 
+    # Unsupported language — return raw query; pipeline will handle the
+    # final_response message set by detect_language.
     if detected_lang == "unsupported":
         return detected_lang, query
 
+    # Step 2 — translate if not English
     if detected_lang.lower() not in ["en", "english"]:
         trans_result = await _translate_to_english(state, _pipeline_llm)
         english_query = trans_result.get("english_query", query)
@@ -77,9 +83,13 @@ async def _detect_and_translate(query: str) -> tuple[str, str]:
         english_query = query
 
     return detected_lang, english_query
-
-
-# ── LangSmith tracing setup ──────────────────────────────────────────────────
+ 
+# ── LangSmith tracing setup ─────────────────────────────────────────────────────
+# Uses RunTree for a single root run per request with child runs for every step.
+# This produces ONE clean trace with a full waterfall instead of multiple
+# disconnected "OllamaChat" runs that LangChain auto-creates.
+# LANGCHAIN_TRACING_V2 must remain True in .env for LangGraph internal traces,
+# but we use metadata["root_run_id"] to link them to our parent span.
 
 try:
     from langsmith import Client as LangSmithClient, RunTree
@@ -93,118 +103,213 @@ except Exception:
     _ls_available = False
     RunTree        = None
     logger.warning("LangSmith not available — traces will not appear in dashboard")
-
+ 
 app = FastAPI()
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
+
 # Global guardrail toggle state
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+ 
 _guardrail_state = {
+
     "input_enabled":  True,
+
     "output_enabled": True,
+
 }
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
+
 # Guardrail management endpoints
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+ 
 @app.get("/guardrail/status")
+
 async def guardrail_status():
+
     return JSONResponse(content=_guardrail_state)
-
-
+ 
+ 
 @app.post("/guardrail/toggle")
+
 async def guardrail_toggle(payload: dict = Body(...)):
+
     guard_type = payload.get("type", "all")
+
     enabled    = payload.get("enabled", True)
-
+ 
     if guard_type in ("input", "all"):
+
         _guardrail_state["input_enabled"] = bool(enabled)
-        logger.info("Input guardrail toggled | enabled={}", _guardrail_state["input_enabled"])
 
+        logger.info(
+
+            "Input guardrail toggled | enabled={}",
+
+            _guardrail_state["input_enabled"],
+
+        )
+ 
     if guard_type in ("output", "all"):
+
         _guardrail_state["output_enabled"] = bool(enabled)
-        logger.info("Output guardrail toggled | enabled={}", _guardrail_state["output_enabled"])
 
+        logger.info(
+
+            "Output guardrail toggled | enabled={}",
+
+            _guardrail_state["output_enabled"],
+
+        )
+ 
     return JSONResponse(content={"status": "updated", "state": _guardrail_state})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DB knowledge-base endpoints — MySQL integration removed.
-# These stubs keep app.py happy without raising 404 / connection errors.
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/db/status")
-async def db_status():
-    return JSONResponse(content={"enabled": False})
-
-
-@app.post("/db/toggle")
-async def db_toggle(payload: dict = Body(...)):
-    logger.info("DB toggle received but MySQL integration is removed | payload={}", payload)
-    return JSONResponse(content={"status": "ignored", "enabled": False, "message": "MySQL integration has been removed."})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # LangSmith helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+ 
 def _parse_semantic_rule(rejection_msg: str) -> tuple[str, str, str]:
+
+    """
+
+    Extract tier, category, and decision from the rejection message.
+ 
+    runner.py embeds the rule in the block_rule field passed to _audit()
+
+    as "SemanticScopeChecker:BLOCK_OUT_OF_SCOPE" or
+
+    "SemanticHarmfulChecker:BYPASS_BMS".
+ 
+    The rejection_msg itself is the user-facing safety text, so we
+
+    infer tier from its content instead.
+ 
+    Returns (tier, category, decision) — all strings for LangSmith tags.
+
+    """
+
     msg = (rejection_msg or "").lower()
+ 
+    # Tier 1 messages always contain this phrase
 
     if "only answer questions about the aim" in msg:
+
         if "unrelated topic" in msg:
+
             return "Tier1_Semantic", "SCOPE", "BLOCK_OUT_OF_SCOPE"
+
         else:
+
             return "Tier1_Semantic", "SCOPE", "BLOCK_TOO_GENERIC"
+ 
+    # Tier 3 Llama Guard messages
 
     if "llama" in msg or "s1" in msg or "s2" in msg:
+
         return "Tier3_LlamaGuard", "LLAMA_GUARD", "BLOCK_HARMFUL"
+ 
+    # Tier 2 — map known safety warning keywords to category names
+
+    # These appear in the rejection messages defined in semantic_tier2_harmful_v3.py
 
     category_map = [
+
         ("steam explosion",           "WET_CHARGE"),
+
         ("moisture check",            "WET_CHARGE"),
+
         ("damp",                      "WET_CHARGE"),
+
         ("bms safety interlock",      "BYPASS_BMS"),
+
         ("burner management",         "BYPASS_BMS"),
+
         ("gas solenoid",              "FORCE_GAS_VALVE"),
+
         ("unburnt gas",               "FORCE_GAS_VALVE"),
+
         ("welding",                   "WELD_VESSEL"),
+
         ("drilling",                  "WELD_VESSEL"),
+
         ("furnace bay atmosphere",    "BREATHE_ATMOSPHERE"),
+
         ("respiratory",               "BREATHE_ATMOSPHERE"),
+
         ("cl2",                       "USE_CL2_NO_EXTRACT"),
+
         ("chlorine gas",              "USE_CL2_NO_EXTRACT"),
+
         ("fume extraction",           "USE_CL2_NO_EXTRACT"),
+
         ("shift metallurgist",        "CAST_OUT_OF_SPEC"),
+
         ("out-of-spec",               "CAST_OUT_OF_SPEC"),
+
         ("class f",                   "CHARGE_CLASS_F"),
+
         ("unknown alloy",             "CHARGE_CLASS_F"),
+
         ("magnesium",                 "MG_AFTER_FLUX"),
+
         ("salt flux",                 "MG_AFTER_FLUX"),
+
         ("casting pit",               "PIT_ENTRY_NO_PERMIT"),
+
         ("permit to work",            "PIT_ENTRY_NO_PERMIT"),
+
         ("loto",                      "MAINTENANCE_NO_LOTO"),
+
         ("lockout",                   "MAINTENANCE_NO_LOTO"),
+
         ("sabotage",                  "SABOTAGE"),
+
         ("emergency stop",            "SABOTAGE"),
+
         ("falsify",                   "FRAUD_FALSIFICATION"),
+
         ("quality records",           "FRAUD_FALSIFICATION"),
+
         ("process limit",             "VIOLATE_PROCESS_LIMIT"),
+
         ("process limits",            "VIOLATE_PROCESS_LIMIT"),
+
     ]
 
     for keyword, category in category_map:
+
         if keyword in msg:
+
             return "Tier2_Semantic", category, "BLOCK_HARMFUL"
-
+ 
     return "Tier2_Semantic", "UNKNOWN", "BLOCK_HARMFUL"
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# LangSmith RunTree tracing
+# ONE root run per request with child spans for every pipeline step.
+# Produces a single clean waterfall trace instead of disconnected OllamaChat runs.
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def _make_root_run(run_id: str, query: str, tags: list[str]) -> "RunTree | None":
+def _make_root_run(
+    run_id:     str,
+    query:      str,
+    tags:       list[str],
+) -> "RunTree | None":
+    """
+    Create and post the root RunTree span for this request.
+    Returns the RunTree object (caller must call .end() when done)
+    or None if LangSmith is unavailable.
+    All child spans are attached via rt.create_child().
+    """
     if not _ls_available or RunTree is None:
         return None
     try:
@@ -223,12 +328,16 @@ def _make_root_run(run_id: str, query: str, tags: list[str]) -> "RunTree | None"
 
 
 def _child(
-    root:     "RunTree | None",
-    name:     str,
-    run_type: str,
-    inputs:   dict,
-    tags:     list[str] | None = None,
+    root:       "RunTree | None",
+    name:       str,
+    run_type:   str,
+    inputs:     dict,
+    tags:       list[str] | None = None,
 ) -> "RunTree | None":
+    """
+    Create and post a child span under root.
+    Returns the child RunTree so caller can .end() it.
+    """
     if root is None:
         return None
     try:
@@ -245,7 +354,12 @@ def _child(
         return None
 
 
-def _end_child(child: "RunTree | None", outputs: dict, error: str | None = None) -> None:
+def _end_child(
+    child:   "RunTree | None",
+    outputs: dict,
+    error:   str | None = None,
+) -> None:
+    """End and patch a child span with outputs (and optional error)."""
     if child is None:
         return
     try:
@@ -261,6 +375,7 @@ def _end_root(
     tags:    list[str] | None = None,
     error:   str | None = None,
 ) -> None:
+    """End and patch the root span."""
     if root is None:
         return
     try:
@@ -271,6 +386,10 @@ def _end_root(
     except Exception as e:
         logger.warning("LangSmith end_root failed | error={}", str(e))
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backwards-compat wrappers used by blocked/passed paths
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _trace_blocked_query(
     run_id:        str,
@@ -288,6 +407,8 @@ def _trace_blocked_query(
     score_out:     float | None = None,
     harm_score:    float | None = None,
     matched_proto: str | None = None,
+    # Root RunTree — when provided the trace is attached as a child;
+    # when None a standalone flat run is created (backwards compat).
     root:          "RunTree | None" = None,
 ) -> None:
     if not _ls_available or _ls_client is None:
@@ -337,9 +458,12 @@ def _trace_blocked_query(
         )
 
         if root is not None:
+            # Attach as child span so it appears in the waterfall
             child = _child(root, f"guardrail_blocked:{stage}", "chain", inputs, tags)
             _end_child(child, outputs, error=error_str)
         else:
+            # Standalone run (backwards compat for output-guardrail blocks
+            # where root may not be available)
             now = datetime.datetime.utcnow()
             _ls_client.create_run(
                 name=f"plant-advisor-{run_id}",
@@ -356,8 +480,8 @@ def _trace_blocked_query(
         logger.debug(
             "LangSmith blocked trace | run_id={} tier={} category={} score_in={} harm_score={}",
             run_id, tier, category,
-            f"{score_in:.3f}" if score_in is not None else "—",
-            f"{harm_score:.3f}" if harm_score is not None else "—",
+            f"{score_in:.3f}" if score_in is not None else "â",
+            f"{harm_score:.3f}" if harm_score is not None else "â",
         )
     except Exception as e:
         logger.warning("LangSmith trace failed | run_id={} error={}", run_id, str(e))
@@ -377,7 +501,7 @@ def _trace_passed_query(
         return
     try:
         tags = ["passed", "input_guardrail"]
-        if score_in   is not None and score_in   < 0.50: tags.append("t1_near_miss")
+        if score_in is not None and score_in < 0.50:  tags.append("t1_near_miss")
         if harm_score is not None and harm_score >= 0.55: tags.append("t2_near_miss")
 
         outputs = {
@@ -409,58 +533,95 @@ def _trace_passed_query(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Audit writer
-# ─────────────────────────────────────────────────────────────────────────────
 
+# Audit writer — for OUTPUT guardrail results and PASSED / ERROR outcomes
+
+# Input guardrail audit is written inside runner.py validate_query()
+
+# ─────────────────────────────────────────────────────────────────────────────
+ 
 def _write_audit(
+
     run_id:           str,
+
     query:            str,
+
     status:           str,
+
     block_stage:      str  | None,
+
     block_rule:       str  | None,
+
     block_reason:     str  | None,
+
     detected_lang:    str  | None,
+
     chunks_retrieved: int,
+
     latency_ms:       int,
+
     input_guard_on:   bool,
+
     output_guard_on:  bool,
+
     llm_response:     str  | None = None,
+
 ) -> None:
+
     logger.bind(query_audit=True).info(
+
         "QUERY_AUDIT",
+
         run_id=run_id,
+
         query=query,
+
         status=status,
+
         block_stage=block_stage,
+
         block_rule=block_rule,
+
         block_reason=block_reason,
+
         llm_response=llm_response,
+
         detected_lang=detected_lang,
+
         chunks_retrieved=chunks_retrieved,
+
         latency_ms=latency_ms,
+
         input_guard_on=input_guard_on,
+
         output_guard_on=output_guard_on,
+
     )
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
+
 # Main streaming endpoint
+
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 @app.get("/stream")
+
 async def stream(query: str, request: Request):
-
+ 
     run_id           = str(uuid.uuid4())[:8]
-    run_input_guard  = _guardrail_state["input_enabled"]
-    run_output_guard = _guardrail_state["output_enabled"]
 
+    run_input_guard  = _guardrail_state["input_enabled"]
+
+    run_output_guard = _guardrail_state["output_enabled"]
+ 
     async def generator():
 
         start            = time.time()
         first_token_time = None
         final_answer     = ""
         current_state    = {}
-        root_rt          = None
+        root_rt          = None   # LangSmith root RunTree for this request
         # Token counts — populated by on_chat_model_end event
         _captured_prompt_tokens     = 0
         _captured_completion_tokens = 0
@@ -472,6 +633,15 @@ async def stream(query: str, request: Request):
             run_input_guard, run_output_guard,
         )
 
+        # ── Create root LangSmith RunTree span ───────────────────────────────
+        # ONE root run per request. Every step below is a child of this span.
+        # This eliminates the stray "OllamaChat" runs LangChain emits separately.
+        root_tags = [
+            "plant-advisor",
+            f"lang:{detected_lang_hint if False else 'pending'}",
+            "input_guard:on" if run_input_guard  else "input_guard:off",
+            "output_guard:on" if run_output_guard else "output_guard:off",
+        ]
         root_rt = _make_root_run(run_id=run_id, query=query, tags=["plant-advisor"])
 
         try:
@@ -526,6 +696,7 @@ async def stream(query: str, request: Request):
                 detected_lang, english_query[:120],
             )
 
+            # Update root run input with resolved language info
             if root_rt is not None:
                 try:
                     root_rt.inputs.update({
@@ -579,7 +750,7 @@ async def stream(query: str, request: Request):
 
             if run_input_guard:
 
-                # ── Tier 1 ───────────────────────────────────────────────────
+                # ── Tier 1 ──────────────────────────────────────────────────
                 t1_start = time.time()
                 child_t1 = _child(
                     child_guard, "tier1_scope_check", "chain",
@@ -657,7 +828,7 @@ async def stream(query: str, request: Request):
 
                 except Exception as e:
                     logger.error(
-                        "Direct checker access failed | run_id={} error={} — falling back",
+                        "Direct checker access failed | run_id={} error={} â falling back",
                         run_id, str(e),
                     )
                     passed, rejection_msg = validate_query_regex_only(
@@ -698,6 +869,7 @@ async def stream(query: str, request: Request):
                             tier = "Tier3_LlamaGuard"; category = "LLAMA_GUARD"; decision = "BLOCK_HARMFUL"
 
                 elif passed and _t2_safe_pass:
+                    # Tier 3 skipped — log this as a child span so it's visible
                     child_t3_skip = _child(
                         child_guard, "tier3_llama_guard_SKIPPED", "chain",
                         {"reason": "safe_passage=True from Tier2"},
@@ -742,10 +914,10 @@ async def stream(query: str, request: Request):
                 log.warning(
                     "Input guardrail blocked | run_id={} tier={} category={} "
                     "score_in={} score_out={} harm_score={} reason={}",
-                    run_id, tier or "unknown", category or "—",
-                    f"{_t1_score_in:.3f}"   if _t1_score_in   is not None else "—",
-                    f"{_t1_score_out:.3f}"  if _t1_score_out  is not None else "—",
-                    f"{_t2_harm_score:.3f}" if _t2_harm_score is not None else "—",
+                    run_id, tier or "unknown", category or "â",
+                    f"{_t1_score_in:.3f}"   if _t1_score_in   is not None else "â",
+                    f"{_t1_score_out:.3f}"  if _t1_score_out  is not None else "â",
+                    f"{_t2_harm_score:.3f}" if _t2_harm_score is not None else "â",
                     (rejection_msg or "")[:200],
                 )
 
@@ -769,6 +941,7 @@ async def stream(query: str, request: Request):
                     "block_reason":    (rejection_msg or "")[:300],
                 }, tags=["blocked", "input_guardrail", tier or ""])
 
+                # ── Terminal waterfall for blocked input ─────────────────
                 print_request_waterfall(
                     run_id=run_id,
                     query=query,
@@ -834,10 +1007,12 @@ async def stream(query: str, request: Request):
                 "retrieve", "grade", "generate", "translate_out",
             ]
 
+            # Per-node timing for waterfall
             _node_start_times: dict[str, float] = {}
             _node_timings:     dict[str, int]   = {}
             _node_children:    dict[str, "RunTree | None"] = {}
 
+            # Pipeline-level child span
             child_pipeline = _child(
                 root_rt, "langgraph_pipeline", "chain",
                 {"english_query": english_query, "detected_lang": detected_lang},
@@ -862,6 +1037,8 @@ async def stream(query: str, request: Request):
                         "tags":       [f"run_id:{run_id}"],
                         "metadata":   {
                             "run_id":      run_id,
+                            # Linking metadata — LangSmith uses this to attach
+                            # LangGraph's internal spans as children of our root.
                             "root_run_id": str(root_rt.id) if root_rt else "",
                         },
                     },
@@ -908,7 +1085,7 @@ async def stream(query: str, request: Request):
 
                     # LLM usage metrics — capture token counts from on_chat_model_end.
                     # Ollama often returns None for usage_metadata so we fall back
-                    # to a word-count estimate when the API gives nothing.
+                    # to a tiktoken-based word estimate when the API gives nothing.
                     if kind == "on_chat_model_end":
                         llm_output = event["data"].get("output")
                         if llm_output and hasattr(llm_output, "generations"):
@@ -925,6 +1102,8 @@ async def stream(query: str, request: Request):
                                     _resp_text = getattr(gen.message, "content", "") or ""
                                     _captured_completion_tokens = max(1, round(len(_resp_text.split()) / 0.75))
                                 if _captured_prompt_tokens == 0:
+                                    # Rough estimate: accumulated final_answer is the completion,
+                                    # prompt is typically 3–5x longer; use 4x as default
                                     _captured_prompt_tokens = _captured_completion_tokens * 4
                                 if _captured_total_tokens == 0:
                                     _captured_total_tokens = _captured_prompt_tokens + _captured_completion_tokens
@@ -1113,8 +1292,8 @@ async def stream(query: str, request: Request):
                 yield json.dumps({"type": "start"}) + "\n"
                 yield json.dumps({"type": "token", "content": final_answer}) + "\n"
             else:
+                # Signal UI to show a translating spinner while we wait
                 yield json.dumps({"type": "node", "node": "translate_out"}) + "\n"
-                yield json.dumps({"type": "start"}) + "\n"
 
                 import asyncio as _asyncio
                 _pair = {"german": "E2G", "de": "E2G", "korean": "E2K", "ko": "E2K"}.get(detected_lang.lower())
@@ -1125,6 +1304,10 @@ async def stream(query: str, request: Request):
                 else:
                     translated_answer = final_answer
 
+                # Translation done — NOW signal start and stream chunks immediately
+                yield json.dumps({"type": "node_done", "node": "translate_out"}) + "\n"
+                yield json.dumps({"type": "start"}) + "\n"
+
                 _words = translated_answer.split()
                 for _i in range(0, len(_words), 4):
                     _chunk = " ".join(_words[_i:_i+4])
@@ -1133,7 +1316,6 @@ async def stream(query: str, request: Request):
                     yield json.dumps({"type": "token", "content": _chunk}) + "\n"
 
                 final_answer = translated_answer
-                yield json.dumps({"type": "node_done", "node": "translate_out"}) + "\n"
 
             # ── Done ─────────────────────────────────────────────────────────
             latency = round(time.time() - start, 3)
@@ -1219,4 +1401,4 @@ async def stream(query: str, request: Request):
             yield json.dumps({"type": "error", "message": f"Stream crashed: {str(e)}"}) + "\n"
 
     return StreamingResponse(generator(), media_type="application/x-ndjson")
-```
+ 
