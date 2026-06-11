@@ -622,6 +622,10 @@ async def stream(query: str, request: Request):
         final_answer     = ""
         current_state    = {}
         root_rt          = None   # LangSmith root RunTree for this request
+        # Token counts — populated by on_chat_model_end event
+        _captured_prompt_tokens     = 0
+        _captured_completion_tokens = 0
+        _captured_total_tokens      = 0
 
         log = logger.bind(run_id=run_id, query=query[:120])
         log.info(
@@ -642,7 +646,9 @@ async def stream(query: str, request: Request):
 
         try:
 
-            # ── 0. DETECT LANGUAGE + TRANSLATE ───────────────────────────────
+            # ── 0. DETECT LANGUAGE ───────────────────────────────────────────
+            # Split into two separate steps so the UI shows accurate timings
+            # for each: detect_lang first, then translate_in only if needed.
             t_detect_start = time.time()
             yield json.dumps({"type": "node", "node": "detect_lang"}) + "\n"
 
@@ -652,30 +658,38 @@ async def stream(query: str, request: Request):
                 tags=["detect_lang"],
             )
 
-            detected_lang, english_query = await _detect_and_translate(query)
-            t_detect_ms = round((time.time() - t_detect_start) * 1000)
+            # Step 1: language detection only
+            _detect_state: dict = {"user_query": query, "executed_nodes": []}
+            _lang_result = _detect_language(_detect_state)
+            _detect_state.update(_lang_result)
+            detected_lang = _detect_state.get("detected_lang", "English")
+            t_detect_ms   = round((time.time() - t_detect_start) * 1000)
 
             yield json.dumps({"type": "node_done", "node": "detect_lang"}) + "\n"
-
             _end_child(child_detect, {
                 "detected_lang": detected_lang,
-                "english_query": english_query,
                 "latency_ms":    t_detect_ms,
             })
 
-            # Translation child span (only when non-English)
+            # Step 2: translate to English (only for non-English queries)
             if detected_lang.lower() not in ["en", "english", "unsupported"]:
+                t_trans_start = time.time()
                 yield json.dumps({"type": "node", "node": "translate_in"}) + "\n"
                 child_trans = _child(
                     root_rt, "translate_in", "chain",
                     {"query": query, "detected_lang": detected_lang},
                     tags=["translate_in"],
                 )
+                trans_result  = await _translate_to_english(_detect_state, _pipeline_llm)
+                english_query = trans_result.get("english_query", query)
+                t_trans_ms    = round((time.time() - t_trans_start) * 1000)
                 _end_child(child_trans, {
                     "english_query": english_query,
-                    "latency_ms":    t_detect_ms,
+                    "latency_ms":    t_trans_ms,
                 })
                 yield json.dumps({"type": "node_done", "node": "translate_in"}) + "\n"
+            else:
+                english_query = query if detected_lang.lower() != "unsupported" else query
 
             log.info(
                 "Pre-guardrail translation | detected_lang={} english_query={}",
@@ -1058,9 +1072,8 @@ async def stream(query: str, request: Request):
                         log.debug("Node done | node={} latency_ms={}", name, node_ms)
                         yield json.dumps({"type": "node_done", "node": name}) + "\n"
 
-                    # Token streaming — always stream to UI regardless of output guard.
-                    # The output guard runs after full generation and sends a
-                    # "replace" event to overwrite the already-streamed text if blocked.
+                    # Accumulate tokens silently — output guardrail runs after full
+                    # generation. Answer is only sent to UI after guardrail passes.
                     if kind == "on_chat_model_stream" and "final_node" in tags:
                         chunk = event["data"].get("chunk")
                         if chunk and hasattr(chunk, "content") and chunk.content:
@@ -1068,37 +1081,40 @@ async def stream(query: str, request: Request):
                                 first_token_time = time.time()
                                 ttft_val = round(first_token_time - start, 3)
                                 log.debug("First token | ttft={}s", ttft_val)
-                                yield json.dumps({"type": "start"}) + "\n"
                             final_answer += chunk.content
-                            yield json.dumps({"type": "token", "content": chunk.content}) + "\n"
 
-                    # LLM usage metrics — capture token counts + speed from LLM end events
+                    # LLM usage metrics — capture token counts from LLM end events
+                    # Stored in dedicated local vars so waterfall can read them.
                     if kind == "on_chat_model_end":
                         llm_output = event["data"].get("output")
                         if llm_output and hasattr(llm_output, "generations"):
                             try:
                                 gen = llm_output.generations[0][0]
                                 usage = getattr(gen.message, "usage_metadata", None) or {}
-                                prompt_tokens     = usage.get("input_tokens",  0)
-                                completion_tokens = usage.get("output_tokens", 0)
-                                total_tokens      = usage.get("total_tokens",  prompt_tokens + completion_tokens)
-                                llm_elapsed       = round((time.time() - start) * 1000)
-                                tokens_per_sec    = round(completion_tokens / max(llm_elapsed / 1000, 0.001), 1) if completion_tokens else None
-
+                                _captured_prompt_tokens     = usage.get("input_tokens",  0) or 0
+                                _captured_completion_tokens = usage.get("output_tokens", 0) or 0
+                                _captured_total_tokens      = usage.get("total_tokens",  _captured_prompt_tokens + _captured_completion_tokens) or 0
+                                llm_elapsed    = round((time.time() - start) * 1000)
+                                tokens_per_sec = round(_captured_completion_tokens / max(llm_elapsed / 1000, 0.001), 1) if _captured_completion_tokens else None
+                                log.info(
+                                    "LLM metrics | prompt_tokens={} completion_tokens={} total={} tok/s={}",
+                                    _captured_prompt_tokens, _captured_completion_tokens,
+                                    _captured_total_tokens, tokens_per_sec,
+                                )
                                 child_llm = _child(
                                     child_pipeline, "llm_call", "llm",
                                     inputs={"model": event.get("name", "ollama")},
                                     tags=["llm", "generate"],
                                 )
                                 _end_child(child_llm, {
-                                    "prompt_tokens":     prompt_tokens,
-                                    "completion_tokens": completion_tokens,
-                                    "total_tokens":      total_tokens,
+                                    "prompt_tokens":     _captured_prompt_tokens,
+                                    "completion_tokens": _captured_completion_tokens,
+                                    "total_tokens":      _captured_total_tokens,
                                     "tokens_per_sec":    tokens_per_sec,
                                     "latency_ms":        llm_elapsed,
                                 })
-                            except Exception:
-                                pass
+                            except Exception as _tok_ex:
+                                log.warning("Token count capture failed: {}", str(_tok_ex))
 
                 pipeline_ms = round((time.time() - start) * 1000)
                 _end_child(child_pipeline, {
@@ -1111,7 +1127,10 @@ async def stream(query: str, request: Request):
                 _end_child(child_pipeline, {}, error=str(e))
                 raise
 
-            # ── 3. OUTPUT GUARDRAIL ───────────────────────────────────────────
+            # ── 3. OUTPUT GUARDRAIL ─────────────────────────────────────────
+            # Runs on the ENGLISH answer BEFORE anything is sent to the UI.
+            # Only after guardrail passes does the response appear on screen.
+            # For non-English queries translation happens AFTER guardrail.
             latency = round(time.time() - start, 3)
             ttft    = round((first_token_time - start), 3) if first_token_time else latency
 
@@ -1125,12 +1144,14 @@ async def stream(query: str, request: Request):
                     "for your query. Please rephrase or ask about a specific "
                     "AIM system component, fault, or procedure."
                 )
-                yield json.dumps({"type": "start"}) + "\n"
-                yield json.dumps({"type": "token", "content": final_answer}) + "\n"
 
             metadata       = current_state.get("retrieval_metadata", [])
             context_chunks = [m.get("retrieved_context", "") for m in metadata]
             detected_lang  = current_state.get("detected_lang", detected_lang)
+
+            # Use the captured token counts
+            prompt_tokens     = _captured_prompt_tokens
+            completion_tokens = _captured_completion_tokens
 
             if run_output_guard and final_answer:
                 t_outguard_start = time.time()
@@ -1142,10 +1163,6 @@ async def stream(query: str, request: Request):
                     tags=["guardrail", "output"],
                 )
 
-                # Regex check child
-                # Regex/keyword check removed — LlamaGuard is the sole output check.
-                # Fast-paths (refusal + safe structured response) are handled inside
-                # classify_output() before LlamaGuard is called.
                 yield json.dumps({"type": "node_done", "node": "output_guardrail"}) + "\n"
                 out_passed = True
                 out_msg    = None
@@ -1209,32 +1226,24 @@ async def stream(query: str, request: Request):
                         "block_reason":   (out_msg or "")[:300],
                     }, tags=["blocked", "output_guardrail"])
 
-                    # ── Terminal waterfall for blocked output ─────────────
                     _wf_chunks_meta2 = current_state.get("retrieval_metadata", [])
-                    _wf_pt2  = current_state.get("prompt_tokens",     0) or 0
-                    _wf_ct2  = current_state.get("completion_tokens", 0) or 0
                     print_request_waterfall(
-                        run_id=run_id,
-                        query=query,
+                        run_id=run_id, query=query,
                         detected_lang=detected_lang or "unknown",
                         input_guard_on=run_input_guard,
                         output_guard_on=run_output_guard,
                         guard_passed=False,
-                        t1_score_in=_t1_score_in,
-                        t1_score_out=_t1_score_out,
+                        t1_score_in=_t1_score_in, t1_score_out=_t1_score_out,
                         t1_latency_ms=_t1_latency_ms,
-                        t2_harm_score=_t2_harm_score,
-                        t2_safe_pass=_t2_safe_pass,
-                        t2_latency_ms=_t2_latency_ms,
-                        t3_latency_ms=_t3_latency_ms,
-                        block_tier="OutputGuardrail",
-                        block_category="HARMFUL_RESPONSE",
+                        t2_harm_score=_t2_harm_score, t2_safe_pass=_t2_safe_pass,
+                        t2_latency_ms=_t2_latency_ms, t3_latency_ms=_t3_latency_ms,
+                        block_tier="OutputGuardrail", block_category="HARMFUL_RESPONSE",
                         block_reason=out_msg,
                         node_timings=_node_timings,
                         chunks_retrieved=len(_wf_chunks_meta2),
                         chunk_scores=[round(m.get("rerank_score", 0) or 0, 3) for m in _wf_chunks_meta2[:5]],
-                        prompt_tokens=_wf_pt2,
-                        completion_tokens=_wf_ct2,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
                         ttft_ms=round(ttft * 1000),
                         total_latency_ms=round(latency * 1000),
                         outcome="BLOCKED_OUTPUT",
@@ -1248,43 +1257,67 @@ async def stream(query: str, request: Request):
 
                 _end_child(child_outguard, {"passed": True, "latency_ms": t_outguard_ms})
                 log.info("Output guardrail passed")
-                # Tokens were already streamed live — nothing more to send here.
+
+            # ── 4. SEND RESPONSE TO UI ───────────────────────────────────────
+            # Guardrail passed (or disabled). Decide how to send:
+            #   English     → full answer in one event.
+            #   Non-English → translate and stream in 4-word chunks.
+
+            is_english = detected_lang.lower() in ["en", "english", "unsupported"]
+
+            if is_english:
+                yield json.dumps({"type": "start"}) + "\n"
+                yield json.dumps({"type": "token", "content": final_answer}) + "\n"
+            else:
+                yield json.dumps({"type": "node", "node": "translate_out"}) + "\n"
+                yield json.dumps({"type": "start"}) + "\n"
+
+                import asyncio as _asyncio
+                _pair = {"german": "E2G", "de": "E2G", "korean": "E2K", "ko": "E2K"}.get(detected_lang.lower())
+                if _pair:
+                    from agents.translator import translate as _sync_translate
+                    _translated, _ = await _asyncio.to_thread(_sync_translate, final_answer, _pair)
+                    translated_answer = _translated.strip()
+                else:
+                    translated_answer = final_answer
+
+                _words = translated_answer.split()
+                for _i in range(0, len(_words), 4):
+                    _chunk = " ".join(_words[_i:_i+4])
+                    if _i + 4 < len(_words):
+                        _chunk += " "
+                    yield json.dumps({"type": "token", "content": _chunk}) + "\n"
+
+                final_answer = translated_answer
+                yield json.dumps({"type": "node_done", "node": "translate_out"}) + "\n"
 
             # ── Done ─────────────────────────────────────────────────────────
             latency = round(time.time() - start, 3)
             ttft    = round((first_token_time - start), 3) if first_token_time else latency
 
             log.info(
-                "Request done | latency={}s ttft={}s chunks={} lang={}",
+                "Request done | latency={}s ttft={}s chunks={} lang={} prompt_tokens={} completion_tokens={}",
                 latency, ttft, len(metadata), detected_lang or "unknown",
+                prompt_tokens, completion_tokens,
             )
 
-            # ── Terminal waterfall — printed after every completed request ────
             _wf_chunks_meta = current_state.get("retrieval_metadata", [])
-            _wf_pt  = current_state.get("prompt_tokens",     0) or 0
-            _wf_ct  = current_state.get("completion_tokens", 0) or 0
             print_request_waterfall(
-                run_id=run_id,
-                query=query,
+                run_id=run_id, query=query,
                 detected_lang=detected_lang or "unknown",
                 input_guard_on=run_input_guard,
                 output_guard_on=run_output_guard,
                 guard_passed=True,
-                t1_score_in=_t1_score_in,
-                t1_score_out=_t1_score_out,
+                t1_score_in=_t1_score_in, t1_score_out=_t1_score_out,
                 t1_latency_ms=_t1_latency_ms,
-                t2_harm_score=_t2_harm_score,
-                t2_safe_pass=_t2_safe_pass,
-                t2_latency_ms=_t2_latency_ms,
-                t3_latency_ms=_t3_latency_ms,
-                block_tier=None,
-                block_category=None,
-                block_reason=None,
+                t2_harm_score=_t2_harm_score, t2_safe_pass=_t2_safe_pass,
+                t2_latency_ms=_t2_latency_ms, t3_latency_ms=_t3_latency_ms,
+                block_tier=None, block_category=None, block_reason=None,
                 node_timings=_node_timings,
                 chunks_retrieved=len(_wf_chunks_meta),
                 chunk_scores=[round(m.get("rerank_score", 0) or 0, 3) for m in _wf_chunks_meta[:5]],
-                prompt_tokens=_wf_pt,
-                completion_tokens=_wf_ct,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
                 ttft_ms=round(ttft * 1000),
                 total_latency_ms=round(latency * 1000),
                 outcome="PASSED",
@@ -1298,24 +1331,17 @@ async def stream(query: str, request: Request):
                 input_guard_on=run_input_guard, output_guard_on=run_output_guard,
             )
 
-            # ── Finalise root run with full metrics ───────────────────────────
-            chunks_meta = current_state.get("retrieval_metadata", [])
-            prompt_tokens     = current_state.get("prompt_tokens",     0)
-            completion_tokens = current_state.get("completion_tokens", 0)
-            tokens_per_sec    = round(
-                completion_tokens / max(ttft, 0.001), 1
-            ) if completion_tokens else None
+            chunks_meta    = current_state.get("retrieval_metadata", [])
+            tokens_per_sec = round(completion_tokens / max(ttft, 0.001), 1) if completion_tokens else None
 
             _end_root(root_rt, {
                 "outcome":              "PASSED",
                 "final_response":       final_answer[:500],
                 "detected_lang":        detected_lang,
                 "english_query":        english_query,
-                # ── Timing waterfall ──────────────────────────────────────
                 "total_latency_ms":     round(latency * 1000),
                 "ttft_ms":              round(ttft * 1000),
                 "tokens_per_sec":       tokens_per_sec,
-                # ── Guardrail scores ──────────────────────────────────────
                 "t1_score_in":          _t1_score_in,
                 "t1_score_out":         _t1_score_out,
                 "t1_latency_ms":        _t1_latency_ms,
@@ -1323,11 +1349,9 @@ async def stream(query: str, request: Request):
                 "t2_safe_passage":      _t2_safe_pass,
                 "t2_latency_ms":        _t2_latency_ms,
                 "t3_latency_ms":        _t3_latency_ms,
-                # ── Retrieval ────────────────────────────────────────────
                 "chunks_retrieved":     len(chunks_meta),
                 "chunk_scores":         [round(m.get("score", 0), 3) for m in chunks_meta[:5]],
                 "chunk_sources":        [m.get("source", "") for m in chunks_meta[:5]],
-                # ── LLM metrics ──────────────────────────────────────────
                 "prompt_tokens":        prompt_tokens,
                 "completion_tokens":    completion_tokens,
             }, tags=["passed"])
