@@ -1201,37 +1201,52 @@ for idx, msg in enumerate(st.session_state.full_messages):
             st.markdown(msg["content"])
  
  
-# ── Suggested maintenance questions ───────────────────────────
-# Pre-populated, in-scope prompts shown on an empty chat. Clicking one
-# sets pending_query, which is picked up below and fed through the exact
-# same stream_answer() / /stream pipeline as a typed question.
+# ── Suggested maintenance questions ───────────────────────
+# Compact chips shown permanently, directly above the chat input. Each chip
+# shows a short label but sends the full question through the same
+# stream_answer() / /stream pipeline as a typed query. The render call lives
+# at the very bottom of the script so the chips always sit just above the
+# (viewport-pinned) chat input box.
 
 SUGGESTED_QUESTIONS = [
-    "What is the lockout/tagout (LOTO) procedure before furnace or casting pit maintenance?",
-    "What are the daily per-shift maintenance tasks for the casting pit?",
-    "How often should the ILD graphite rotor be replaced?",
-    "When should the casting table hydraulic oil be changed?",
-    "How often are the furnace thermocouples replaced?",
-    "What PPE is required for refractory maintenance work?",
+    ("🔒 LOTO procedure",       "What is the lockout/tagout (LOTO) procedure before furnace or casting pit maintenance?"),
+    ("🗓️ Daily pit tasks",      "What are the daily per-shift maintenance tasks for the casting pit?"),
+    ("🌀 ILD rotor interval",   "How often should the ILD graphite rotor be replaced?"),
+    ("🛢️ Hydraulic oil change", "When should the casting table hydraulic oil be changed?"),
+    ("🌡️ Thermocouple change",  "How often are the furnace thermocouples replaced?"),
+    ("🦺 Refractory PPE",       "What PPE is required for refractory maintenance work?"),
 ]
 
 
 def render_suggested_questions():
-    """Render clickable maintenance suggestion chips."""
-    st.markdown("##### 🛠️ Suggested maintenance questions")
-    st.caption("Tap a question to send it straight to the assistant.")
-    cols = st.columns(2)
-    for i, question in enumerate(SUGGESTED_QUESTIONS):
-        with cols[i % 2]:
-            if st.button(question, key=f"suggest_{i}", use_container_width=True):
+    """Render small, always-visible maintenance suggestion chips."""
+    # Scoped CSS: shrink ONLY the suggestion buttons (keyed `suggest_*`) so
+    # they stay compact and don't crowd the answer area. The `st-key-*` class
+    # hook requires Streamlit >= 1.39; on older versions the chips simply
+    # render at normal size (still fully functional).
+    st.markdown(
+        """
+        <style>
+        div[class*="st-key-suggest_"] button {
+            padding: 1px 10px !important;
+            min-height: 0 !important;
+            height: auto !important;
+            line-height: 1.4 !important;
+            border-radius: 14px !important;
+        }
+        div[class*="st-key-suggest_"] button p { font-size: 12px !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption("💡 Quick maintenance questions")
+    cols = st.columns(3)
+    for i, (label, question) in enumerate(SUGGESTED_QUESTIONS):
+        with cols[i % 3]:
+            if st.button(label, key=f"suggest_{i}",
+                         use_container_width=True, help=question):
                 st.session_state.pending_query = question
                 st.rerun()
-
-
-# Show suggestions only when the conversation is empty (welcome state).
-if not st.session_state.full_messages:
-
-    render_suggested_questions()
 
 
 # ── Chat input ────────────────────────────────────────────────
@@ -1303,3 +1318,8 @@ if user_input:
     })
   
     st.rerun()
+
+# ── Suggestion chips render LAST so they sit just above the chat input ──
+# Only reached when no query is being processed (the block above ends in
+# st.rerun()), which keeps the chips pinned directly beneath the latest answer.
+render_suggested_questions()
