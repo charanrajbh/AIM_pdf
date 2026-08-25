@@ -1,0 +1,11 @@
+# Secrets — never commit
+.env
+
+# Workflow logs contain real questions, queries and returned student data
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
